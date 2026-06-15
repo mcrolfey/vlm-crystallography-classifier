@@ -1,0 +1,7 @@
+A-COF
+A-CP
+A-CF
+NA-OF
+NA-CS
+A-AM
+Unknown

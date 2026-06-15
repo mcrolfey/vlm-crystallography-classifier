@@ -1,0 +1,21 @@
+# Generated datasets
+data/train.jsonl
+data/val.jsonl
+
+# Model outputs and checkpoints
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
