@@ -1,22 +1,46 @@
 # VLM Crystallography Classifier
 
-Fine-tune **Qwen2.5-VL-7B-Instruct** (4-bit quantised) as a multi-label
-crystallography / asbestos-fibre classifier using
+Fine-tune **Qwen2.5-VL-3B-Instruct** (4-bit quantised, default) or the 7B variant as a
+multi-label crystallography phase classifier using
 [Unsloth](https://github.com/unslothai/unsloth) + LoRA.
+
+---
+
+## VRAM Requirements
+
+| GPU VRAM | Default model | Vision encoder |
+|----------|--------------|----------------|
+| 8 GB | `Qwen2.5-VL-3B` (default) | Frozen (default) |
+| 12 GB | `Qwen2.5-VL-3B` | Can unfreeze (`--finetune_vision`) |
+| 16 GB+ | `Qwen2.5-VL-7B` (`--model_id ...7B...`) | Can unfreeze |
+
+> **Why 3B by default?** The 7B model weights alone occupy ~4.5 GB in 4-bit.
+> Combined with the Qwen2.5-VL vision encoder's activation memory during
+> training, the 7B model exhausts 8 GB before the loss function can run.
+> The 3B model (~2 GB in 4-bit) trains reliably on 8 GB with equivalent
+> classification accuracy for this task.
 
 ---
 
 ## Class Map
 
-| ID | Name | Description |
-|----|------|-------------|
-| 0 | A-COF | Asbestos Chrysotile Oriented Fibre |
-| 1 | A-CP  | Asbestos Chrysotile Plate / bundle |
-| 2 | A-CF  | Asbestos Chrysotile Fragment |
-| 3 | NA-OF | Non-Asbestos Other Fibre |
-| 4 | NA-CS | Non-Asbestos Crystal / Silicate |
-| 5 | A-AM  | Asbestos Amphibole |
-| 6 | Unknown | Unclassified / ambiguous material |
+Classes are defined in `data/classes.txt` — one name per line, where the line
+index matches the YOLO class ID.  Edit this file to match your own dataset
+before running `prepare_yolo_to_vlm.py`.
+
+Example `classes.txt` for a 7-class crystallography dataset:
+
+```
+Phase_0
+Phase_1
+Phase_2
+Phase_3
+Phase_4
+Phase_5
+Phase_6
+```
+
+Replace each `Phase_N` with your own class names.
 
 ---
 
@@ -45,9 +69,9 @@ crystallography / asbestos-fibre classifier using
 
 ### Prerequisites
 
-- Python 3.10 or 3.11 (3.12 may have issues with some CUDA extensions)
-- CUDA 11.8 or 12.1+ (match your GPU driver)
-- Minimum **8 GB VRAM** (RTX 3060 / 3080 / 4060 Ti / A10 / etc.)
+- Python 3.10 or 3.11
+- CUDA 12.6+ (PyTorch ≥ 2.7.0 is required — see below)
+- Minimum **8 GB VRAM**
 
 ### 1 — Create a virtual environment
 
@@ -59,13 +83,24 @@ venv\Scripts\activate
 source venv/bin/activate
 ```
 
-### 2 — Install PyTorch (CUDA 12.1 example)
+### 2 — Install PyTorch ≥ 2.7.0
+
+Check which CUDA version your driver supports:
+```
+nvidia-smi
+```
+Look for `CUDA Version` in the top-right corner, then install the matching wheel:
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.6 (driver reports 12.6 or higher)
+pip install "torch>=2.7.0" torchvision --index-url https://download.pytorch.org/whl/cu126
+
+# CUDA 12.8
+pip install "torch>=2.7.0" torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
-> For CUDA 11.8: replace `cu121` with `cu118`.
+> PyTorch 2.7.0 is the minimum — earlier versions lack `torch.utils._pytree.register_constant`
+> which is required by `torchao >= 0.16.0` (a hard dependency of recent `peft`).
 
 ### 3 — Install Unsloth + dependencies
 
@@ -75,45 +110,26 @@ pip install --no-deps trl peft accelerate bitsandbytes
 pip install Pillow
 ```
 
-> **Windows note:** if the Unsloth install fails due to `triton`, install the
-> Windows-compatible wheel first:
-> ```bash
-> pip install triton-windows
-> ```
-> Then re-run the Unsloth install.
+> **Windows / triton:** if the install fails on `triton`, run `pip install triton-windows` first.
 
 ---
 
 ## Step 1 — Prepare the Dataset
 
-Convert your YOLO bounding-box dataset to a VLM multi-label classification
-JSONL dataset.  The script is **single-threaded** — safe on Windows.
+Converts YOLO bounding-box labels to image-level multi-label JSONL.
+Single-threaded — safe on Windows.
 
 ```bash
 python prepare_yolo_to_vlm.py \
-    --images "C:\Users\User\Desktop\uncropped_all\combined05-07-26\images" \
-    --labels "C:\Users\User\Desktop\uncropped_all\combined05-07-26\labels" \
+    --images "C:\path\to\images" \
+    --labels "C:\path\to\labels" \
     --classes data/classes.txt \
     --output_train data/train.jsonl \
     --output_val   data/val.jsonl \
     --val_split 0.10
 ```
 
-Expected output:
-
-```
-[INFO] Loaded 7 classes: {0: 'A-COF', 1: 'A-CP', ...}
-[INFO] Found 11933 label files
-[INFO] Valid records : 11800
-...
-[INFO] Split → train: 10620, val: 1180
-[INFO] Wrote 10,620 records → data/train.jsonl
-[INFO] Wrote  1,180 records → data/val.jsonl
-[DONE] Dataset preparation complete.
-```
-
-### Quick test (100 samples)
-
+Quick test (100 samples):
 ```bash
 python prepare_yolo_to_vlm.py --max_samples 100
 ```
@@ -122,75 +138,58 @@ python prepare_yolo_to_vlm.py --max_samples 100
 
 ## Step 2 — Fine-tune
 
+### Default (8 GB GPU, 3B model, frozen vision encoder)
+
 ```bash
 python train_qwen_classifier.py
 ```
 
-### Common flag overrides
+This runs with the settings that work on an 8 GB GPU out of the box.
 
-| Scenario | Flags |
-|----------|-------|
-| 8 GB VRAM | `--max_seq_length 1024 --max_pixels 501760 --grad_accum 16` |
-| 12 GB VRAM | `--max_seq_length 1536 --grad_accum 8` (default) |
-| 16–24 GB VRAM | `--max_seq_length 2048 --grad_accum 4 --batch_size 2` |
-| Freeze vision encoder | `--no_finetune_vision` (saves ~2 GB VRAM) |
-| Resume from checkpoint | `--resume_from_checkpoint outputs/qwen_crystallography/checkpoint-400` |
-| Longer training | `--epochs 5 --learning_rate 1e-4` |
+### Common overrides
 
-### Full low-VRAM example (8 GB)
+| Scenario | Command |
+|----------|---------|
+| 8 GB, resume after crash | `python train_qwen_classifier.py --resume_from_checkpoint outputs/qwen_crystallography/checkpoint-400` |
+| 12 GB, unfreeze vision | `python train_qwen_classifier.py --finetune_vision` |
+| 16 GB+, use 7B model | `python train_qwen_classifier.py --model_id unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit --finetune_vision --max_seq_length 1536` |
+| Longer training | `python train_qwen_classifier.py --epochs 5 --learning_rate 1e-4` |
+| Bigger LoRA | `python train_qwen_classifier.py --lora_r 32 --lora_alpha 32` |
 
+### If you get CUDA Out of Memory
+
+Delete the compiled cache and reduce image resolution:
 ```bash
-python train_qwen_classifier.py \
-    --epochs 3 \
-    --batch_size 1 \
-    --grad_accum 16 \
-    --max_seq_length 1024 \
-    --max_pixels 501760 \
-    --lora_r 8 \
-    --lora_alpha 8 \
-    --no_finetune_vision
+rmdir /s /q unsloth_compiled_cache
+python train_qwen_classifier.py --max_pixels 401408
 ```
+(`401408` ≈ 632×634 pixels; halving this again to `200704` is the floor before image quality degrades significantly.)
 
 ---
 
 ## Outputs
 
-After training finishes you will find:
-
 ```
 outputs/qwen_crystallography/
-├── lora_adapter/        ← Always written. Load with FastVisionModel.from_pretrained().
-├── merged_16bit/        ← Full bf16 model (written only if VRAM ≥ ~20 GB at end).
-└── checkpoint-*/        ← Intermediate checkpoints (latest 3 kept).
+├── lora_adapter/    ← Always written. Use for inference.
+├── merged_16bit/    ← Full bf16 merge (needs ~16 GB free VRAM at save time).
+└── checkpoint-*/    ← Rolling checkpoints (3 most recent kept).
 ```
 
 ---
 
-## Inference (after training)
+## Inference
 
 ```python
 from train_qwen_classifier import run_inference
 
 result = run_inference(
     adapter_path="outputs/qwen_crystallography/lora_adapter",
-    image_path="path/to/your/image.jpg",
-    prompt=open("data/classes.txt").read(),  # or any prompt string
+    image_path="sample.jpg",
+    prompt=open("data/classes.txt").read(),
 )
 print(result)
-# → "NA-OF, A-COF"
-```
-
-Or load the merged model directly with `transformers`:
-
-```python
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-
-model = Qwen2VLForConditionalGeneration.from_pretrained(
-    "outputs/qwen_crystallography/merged_16bit",
-    torch_dtype="auto",
-    device_map="auto",
-)
-processor = AutoProcessor.from_pretrained("outputs/qwen_crystallography/merged_16bit")
+# → "Phase_3, Phase_0"
 ```
 
 ---
@@ -199,26 +198,26 @@ processor = AutoProcessor.from_pretrained("outputs/qwen_crystallography/merged_1
 
 | Symptom | Fix |
 |---------|-----|
-| `CUDA Out of Memory` during training | Add `--grad_accum 16 --max_pixels 501760 --no_finetune_vision` |
-| `CUDA Out of Memory` during merge | Normal on <20 GB VRAM — only `lora_adapter/` is saved, which is fine for inference |
-| Download hangs / timeout | Script retries up to 5× with exponential back-off. Set `HF_HUB_DOWNLOAD_TIMEOUT=300` env var for slow connections |
+| `No or negligible GPU memory` | Delete `unsloth_compiled_cache/`, then re-run. If it persists, reduce `--max_pixels 401408` or use the 3B model (default). |
+| `Some modules dispatched on CPU` | Stale device_map; already fixed in script via `device_map={"": 0}`. If you see it, delete compiled cache and rerun. |
+| `register_constant` / torchao error | PyTorch version too old. Upgrade: `pip install "torch>=2.7.0" torchvision --index-url https://download.pytorch.org/whl/cu126` |
+| `peft` torchao version error | Same root cause — upgrade PyTorch first. |
+| Download hangs / drops | Script retries up to 20× with exponential back-off. Already-cached files are skipped. Increase `--download_timeout 600` on very slow connections. |
 | `triton` import error on Windows | `pip install triton-windows` |
-| `dataloader_num_workers` warning | Already forced to 0 in the script — Windows-safe |
-| Model output is wrong class names | Edit `data/classes.txt` and re-run `prepare_yolo_to_vlm.py` |
+| Model output has wrong class names | Edit `data/classes.txt`, re-run `prepare_yolo_to_vlm.py`, re-run training. |
+| `CUDA Out of Memory` during merge | Normal on <16 GB VRAM — `lora_adapter/` is still saved and fully usable for inference. |
 
 ---
 
 ## Customising Classes
 
-1. Edit `data/classes.txt` — one class name per line, line index = YOLO class ID.
-2. Re-run `prepare_yolo_to_vlm.py` to regenerate the JSONL with new prompts.
+1. Edit `data/classes.txt` — one name per line, line index = YOLO class ID.
+2. Re-run `prepare_yolo_to_vlm.py` (regenerates prompts with new class names).
 3. Re-run `train_qwen_classifier.py`.
 
 ---
 
 ## Citation
-
-If you use this pipeline, please cite:
 
 - Qwen2.5-VL: https://github.com/QwenLM/Qwen2.5-VL
 - Unsloth: https://github.com/unslothai/unsloth

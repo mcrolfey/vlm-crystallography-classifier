@@ -16,9 +16,9 @@ Output (JSONL):
     {
       "image_path": "C:/abs/path/to/image.jpg",
       "label_ids":   [3],
-      "label_names": ["NA-OF"],
+      "label_names": ["Phase_3"],
       "prompt":      "<system + user prompt string>",
-      "response":    "NA-OF"
+      "response":    "Phase_3"
     }
 
 Usage:
@@ -41,26 +41,16 @@ from pathlib import Path
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 SYSTEM_PROMPT = (
-    "You are an expert mineralogist specialising in polarised light microscopy "
-    "and scanning electron microscopy (SEM) for asbestos fibre identification "
-    "and crystallographic phase classification."
+    "You are an expert geologist specialising in polarised light microscopy "
+    "and scanning electron microscopy (SEM) for crystallographic phase classification."
 )
 
 USER_PROMPT_TEMPLATE = """\
-Examine this microscopy image carefully and identify every fibre type or \
-crystallographic phase that is visible.
+Examine this microscopy image carefully and identify every crystallographic \
+phase that is visible.
 
 Available classes:
 {class_list}
-
-Class descriptions:
-  A-COF  – Asbestos Chrysotile Oriented Fibre (thin, parallel-aligned white fibres)
-  A-CP   – Asbestos Chrysotile Plate / bundle (dense, plate-like chrysotile aggregates)
-  A-CF   – Asbestos Chrysotile Fragment (broken, irregular chrysotile pieces)
-  NA-OF  – Non-Asbestos Other Fibre (any non-asbestos fibrous material)
-  NA-CS  – Non-Asbestos Crystal / Silicate (non-fibrous crystalline or amorphous minerals)
-  A-AM   – Asbestos Amphibole (crocidolite, amosite, or other amphibole asbestos)
-  Unknown – Unclassified or ambiguous material
 
 Reply with ONLY the names of the classes present in the image, separated by \
 commas. Do not explain. Do not add extra text."""

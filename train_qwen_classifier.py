@@ -44,80 +44,207 @@ from torch.utils.data import Dataset
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Fine-tune Qwen2.5-VL-7B as a crystallography classifier",
+        description="Fine-tune Qwen2.5-VL as a crystallography classifier",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--model_id", default="unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit")
+    # --- Model ---
+    # Default is 3B: fits comfortably on 8 GB VRAM with frozen vision encoder.
+    # Switch to 7B only if you have ≥ 16 GB VRAM.
+    p.add_argument("--model_id", default="unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit",
+                   help="HuggingFace model ID. 3B works on 8 GB; 7B needs ≥ 16 GB.")
     p.add_argument("--train_jsonl", default="data/train.jsonl")
     p.add_argument("--val_jsonl", default="data/val.jsonl")
     p.add_argument("--output_dir", default="outputs/qwen_crystallography")
+    # --- Training ---
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=1, help="Per-device train batch size.")
     p.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps.")
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
     p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--max_seq_length", type=int, default=1536)
-    p.add_argument("--max_pixels", type=int, default=1003520,
-                   help="Max total image pixels sent to the vision encoder (controls VRAM).")
+    p.add_argument("--max_seq_length", type=int, default=1024,
+                   help="Max token sequence length. Reduce to save VRAM.")
+    p.add_argument("--max_pixels", type=int, default=602112,
+                   help="Max image pixels fed to the vision encoder "
+                        "(602112 ≈ 784×768, safe for 8 GB). Reduce further if OOM.")
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--eval_steps", type=int, default=200)
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--warmup_ratio", type=float, default=0.03)
-    p.add_argument("--download_retries", type=int, default=5,
-                   help="Number of retry attempts for model download.")
-    p.add_argument("--no_finetune_vision", action="store_true",
-                   help="Freeze vision encoder, only train the LLM layers.")
+    # --- Download ---
+    p.add_argument("--download_retries", type=int, default=20,
+                   help="Retry attempts for model download (resumable on dropout).")
+    p.add_argument("--download_timeout", type=int, default=300,
+                   help="Seconds before a single HTTP request times out.")
+    # --- VRAM knobs ---
+    # Frozen vision encoder is the default for 8 GB GPUs: the 3B LLM layers
+    # already hold the class-label knowledge; the vision encoder only needs
+    # to extract patch features, which it does well out-of-the-box.
+    p.add_argument("--finetune_vision", action="store_true",
+                   help="Also train vision encoder LoRA layers (needs ≥ 16 GB VRAM).")
     p.add_argument("--resume_from_checkpoint", default=None,
                    help="Path to a checkpoint directory to resume training from.")
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Fault-tolerant model loader
+# Fault-tolerant model downloader + loader (two separate phases)
 # ---------------------------------------------------------------------------
 
-def load_model_with_retry(
-    model_id: str,
-    max_seq_length: int,
-    max_pixels: int,
-    retries: int = 5,
-):
-    """
-    Load Qwen2.5-VL via Unsloth with exponential-backoff retry.
+# Network exception types we want to retry on.
+# Populated lazily in _network_exceptions() so imports stay optional.
+def _network_exceptions() -> tuple[type[Exception], ...]:
+    """Return a tuple of exception types that indicate a transient network error."""
+    import socket
+    exc_types: list[type[Exception]] = [
+        ConnectionError,       # built-in: covers ConnectionResetError, BrokenPipeError, etc.
+        TimeoutError,          # built-in
+        OSError,               # covers ECONNRESET, EHOSTUNREACH on Windows
+        socket.timeout,
+    ]
+    # requests / urllib3 (HF Hub uses these internally)
+    try:
+        import requests.exceptions as req_exc
+        exc_types += [
+            req_exc.ConnectionError,
+            req_exc.Timeout,
+            req_exc.ChunkedEncodingError,   # connection drops mid-stream
+            req_exc.ReadTimeout,
+            req_exc.ConnectTimeout,
+        ]
+    except ImportError:
+        pass
+    try:
+        import urllib3.exceptions as u3_exc
+        exc_types += [
+            u3_exc.ProtocolError,
+            u3_exc.ReadTimeoutError,
+            u3_exc.ConnectionError,
+        ]
+    except ImportError:
+        pass
+    return tuple(set(exc_types))
 
-    Returns (model, processor).
-    Raises RuntimeError if all attempts fail.
+
+def download_model_with_retry(
+    model_id: str,
+    timeout: int = 300,
+    retries: int = 20,
+) -> str:
     """
-    from unsloth import FastVisionModel
+    Download every model shard to the local HuggingFace cache using
+    snapshot_download, with per-file retry on connection drops.
+
+    Key properties:
+      - Files already in the HF cache are skipped entirely — a dropout
+        only costs the file currently in-flight, not the whole download.
+      - Each HTTP request has a hard `timeout`-second deadline.
+      - Backs off exponentially up to 60 s between attempts.
+      - Skips TF/Flax weights (saves ~7 GB for this model).
+
+    Returns the local cache directory path (pass to from_pretrained).
+    """
+    import socket
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import (
+        HfHubHTTPError,
+        RepositoryNotFoundError,
+        EntryNotFoundError,
+    )
+
+    # Tell the HF Hub HTTP client how long to wait for a single response.
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = str(timeout)
+
+    network_exc = _network_exceptions() + (HfHubHTTPError,)
 
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            print(f"[INFO] Loading model (attempt {attempt}/{retries}): {model_id}")
-            model, processor = FastVisionModel.from_pretrained(
-                model_id,
-                load_in_4bit=True,
-                use_gradient_checkpointing="unsloth",
-                max_seq_length=max_seq_length,
-                # Qwen2.5-VL vision kwargs forwarded through **kwargs
-                min_pixels=256 * 28 * 28,
-                max_pixels=max_pixels,
+            print(f"[INFO] Downloading model [{attempt}/{retries}]: {model_id}")
+            print(f"       Timeout per request: {timeout}s  |  Already-cached files are skipped.")
+            local_dir = snapshot_download(
+                repo_id=model_id,
+                repo_type="model",
+                # Skip TF/Flax variants — saves ~7 GB
+                ignore_patterns=["*.msgpack", "*.h5", "flax_model*", "tf_model*", "rust_model*"],
             )
-            print("[INFO] Model loaded successfully.")
-            return model, processor
-        except Exception as exc:
+            print(f"[INFO] Download complete. Cache dir: {local_dir}")
+            return local_dir
+
+        except (RepositoryNotFoundError, EntryNotFoundError) as exc:
+            # Fatal — wrong model ID or file deleted. Don't retry.
+            raise RuntimeError(
+                f"Model '{model_id}' not found on HuggingFace Hub.\n"
+                f"Check the model ID and your internet connection. Detail: {exc}"
+            ) from exc
+
+        except network_exc as exc:
             last_exc = exc
-            wait = 2 ** attempt  # 2, 4, 8, 16, 32 seconds
-            print(f"[WARN] Load attempt {attempt} failed: {exc}")
+            wait = min(2 ** attempt, 60)   # cap at 60 s
+            print(
+                f"\n[WARN] Network error on attempt {attempt}/{retries}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             if attempt < retries:
-                print(f"       Retrying in {wait}s ...")
+                print(f"       Waiting {wait}s before retry ... (Ctrl+C to abort)")
+                time.sleep(wait)
+
+        except Exception as exc:
+            # Unknown error — still retry, but warn loudly.
+            last_exc = exc
+            wait = min(2 ** attempt, 60)
+            print(f"\n[WARN] Unexpected error on attempt {attempt}/{retries}: {exc}")
+            if attempt < retries:
+                print(f"       Waiting {wait}s before retry ...")
                 time.sleep(wait)
 
     raise RuntimeError(
-        f"Failed to load {model_id} after {retries} attempts. "
-        f"Last error: {last_exc}"
+        f"Download of '{model_id}' failed after {retries} attempts.\n"
+        f"Last error: {last_exc}\n"
+        f"Tip: increase --download_retries or --download_timeout, "
+        f"or manually download via: huggingface-cli download {model_id}"
     )
+
+
+def load_model_from_cache(
+    local_dir: str,
+    max_seq_length: int,
+    max_pixels: int,
+):
+    """
+    Load Qwen2.5-VL from the local HF cache directory.
+    No network access required after download_model_with_retry() succeeds.
+
+    Returns (model, processor).
+    """
+    from unsloth import FastVisionModel
+
+    # Free any scratch memory left over from the download phase.
+    torch.cuda.empty_cache()
+
+    free_gb = (
+        torch.cuda.get_device_properties(0).total_memory
+        - torch.cuda.memory_allocated(0)
+    ) / 1e9
+    print(f"[INFO] Free VRAM before load: {free_gb:.1f} GB")
+    print(f"[INFO] Loading model from local cache: {local_dir}")
+
+    # device_map={"": 0} forces all layers onto GPU 0 without running
+    # the FP16-based size estimation that incorrectly concludes the 4-bit
+    # model (~4.5 GB) won't fit in 8 GB and tries to offload to CPU.
+    model, processor = FastVisionModel.from_pretrained(
+        local_dir,
+        load_in_4bit=True,
+        use_gradient_checkpointing="unsloth",
+        max_seq_length=max_seq_length,
+        device_map={"": 0},
+    )
+    # min_pixels / max_pixels are image-processor settings, not model args.
+    if hasattr(processor, "image_processor"):
+        processor.image_processor.min_pixels = 256 * 28 * 28
+        processor.image_processor.max_pixels = max_pixels
+    print("[INFO] Model loaded successfully.")
+    return model, processor
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +252,8 @@ def load_model_with_retry(
 # ---------------------------------------------------------------------------
 
 SYSTEM_MESSAGE = (
-    "You are an expert mineralogist specialising in polarised light microscopy "
-    "and scanning electron microscopy (SEM) for asbestos fibre identification "
-    "and crystallographic phase classification."
+    "You are an expert geologist specialising in polarised light microscopy "
+    "and scanning electron microscopy (SEM) for crystallographic phase classification."
 )
 
 
@@ -210,13 +336,17 @@ def main() -> None:
     args = parse_args()
 
     # -----------------------------------------------------------------------
-    # 1. Load model + processor
+    # 1. Download model files (resumable, dropout-tolerant), then load
     # -----------------------------------------------------------------------
-    model, processor = load_model_with_retry(
+    local_dir = download_model_with_retry(
         model_id=args.model_id,
+        timeout=args.download_timeout,
+        retries=args.download_retries,
+    )
+    model, processor = load_model_from_cache(
+        local_dir=local_dir,
         max_seq_length=args.max_seq_length,
         max_pixels=args.max_pixels,
-        retries=args.download_retries,
     )
 
     # -----------------------------------------------------------------------
@@ -224,7 +354,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     from unsloth import FastVisionModel
 
-    finetune_vision = not args.no_finetune_vision
+    finetune_vision = args.finetune_vision
     print(f"[INFO] LoRA rank={args.lora_r}, alpha={args.lora_alpha}, "
           f"finetune_vision_layers={finetune_vision}")
 
@@ -339,7 +469,7 @@ def main() -> None:
         print(
             "\n[FATAL] CUDA Out of Memory.\n"
             "  Try: --grad_accum 16, --max_seq_length 1024, --max_pixels 501760, "
-            "or --no_finetune_vision"
+            "or remove --finetune_vision"
         )
         sys.exit(1)
 
