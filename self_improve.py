@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lm_studio_model", default="local-model",
                    help="Model name as shown in LM Studio (or 'local-model').")
     p.add_argument("--llm_temperature", type=float, default=0.3)
-    p.add_argument("--llm_max_tokens",  type=int,   default=1024)
+    p.add_argument("--llm_max_tokens",  type=int,   default=2048)
     # Misc
     p.add_argument("--dry_run", action="store_true",
                    help="Skip actual training; only test the LM Studio suggestion loop.")
@@ -117,12 +117,6 @@ def run_training_cycle(
     ]
     if config.get("system_message"):
         cmd += ["--system_message", config["system_message"]]
-
-    if cycle > 1:
-        # Resume from previous cycle's LoRA adapter if it exists
-        prev_adapter = Path(args.output_dir) / f"cycle_{cycle-1:02d}" / "lora_adapter"
-        if prev_adapter.exists():
-            cmd += ["--resume_from_checkpoint", str(prev_adapter)]
 
     print(f"\n{'='*60}")
     print(f"  CYCLE {cycle}: launching training subprocess")
@@ -246,6 +240,25 @@ def ask_lm_studio(
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
+        # Response was truncated mid-JSON — try trimming to the last complete object
+        last_brace = raw.rfind("}")
+        if last_brace != -1:
+            trimmed = raw[:last_brace + 1]
+            # Walk back to find the matching opening brace for the root object
+            depth = 0
+            for i in range(len(trimmed) - 1, -1, -1):
+                if trimmed[i] == "}":
+                    depth += 1
+                elif trimmed[i] == "{":
+                    depth -= 1
+                if depth == 0:
+                    candidate = trimmed[i:]
+                    try:
+                        parsed = json.loads(candidate)
+                        print("[WARN] LLM response was truncated — recovered partial JSON.")
+                        return parsed
+                    except json.JSONDecodeError:
+                        break
         print(f"[WARN] Could not parse LLM response as JSON: {exc}")
         return None
 
