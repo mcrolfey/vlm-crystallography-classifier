@@ -57,16 +57,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir", default="outputs/qwen_crystallography")
     # --- Training ---
     p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--max_steps", type=int, default=-1,
+                   help="If > 0, stop after this many steps (overrides --epochs). "
+                        "Useful for quick self-improvement cycles.")
     p.add_argument("--batch_size", type=int, default=1, help="Per-device train batch size.")
     p.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps.")
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
     p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--max_seq_length", type=int, default=1024,
-                   help="Max token sequence length. Reduce to save VRAM.")
-    p.add_argument("--max_pixels", type=int, default=602112,
+    p.add_argument("--max_seq_length", type=int, default=512,
+                   help="Max token sequence length. 512 is enough for classification.")
+    p.add_argument("--max_pixels", type=int, default=200704,
                    help="Max image pixels fed to the vision encoder "
-                        "(602112 ≈ 784×768, safe for 8 GB). Reduce further if OOM.")
+                        "(200704 = 256×28×28, ~3-4x faster than 602112). "
+                        "Raise to 401408 if detail is needed.")
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--eval_steps", type=int, default=200)
     p.add_argument("--logging_steps", type=int, default=10)
@@ -84,6 +88,10 @@ def parse_args() -> argparse.Namespace:
                    help="Also train vision encoder LoRA layers (needs ≥ 16 GB VRAM).")
     p.add_argument("--resume_from_checkpoint", default=None,
                    help="Path to a checkpoint directory to resume training from.")
+    p.add_argument("--metrics_output", default=None,
+                   help="If set, write a JSON file with final metrics after training completes.")
+    p.add_argument("--system_message", default=None,
+                   help="Override the default system message used in training prompts.")
     return p.parse_args()
 
 
@@ -241,7 +249,7 @@ def load_model_from_cache(
     )
     # min_pixels / max_pixels are image-processor settings, not model args.
     if hasattr(processor, "image_processor"):
-        processor.image_processor.min_pixels = 256 * 28 * 28
+        processor.image_processor.min_pixels = 64 * 28 * 28   # 50176 — floor for tiny crops
         processor.image_processor.max_pixels = max_pixels
     print("[INFO] Model loaded successfully.")
     return model, processor
@@ -251,10 +259,13 @@ def load_model_from_cache(
 # Dataset
 # ---------------------------------------------------------------------------
 
-SYSTEM_MESSAGE = (
+DEFAULT_SYSTEM_MESSAGE = (
     "You are an expert geologist specialising in polarised light microscopy "
     "and scanning electron microscopy (SEM) for crystallographic phase classification."
 )
+
+# Will be set from args in main()
+SYSTEM_MESSAGE = DEFAULT_SYSTEM_MESSAGE
 
 
 class CrystallographyDataset(Dataset):
@@ -335,6 +346,11 @@ class CrystallographyDataset(Dataset):
 def main() -> None:
     args = parse_args()
 
+    global SYSTEM_MESSAGE
+    if args.system_message:
+        SYSTEM_MESSAGE = args.system_message
+        print(f"[INFO] Using custom system message: {SYSTEM_MESSAGE[:80]}...")
+
     # -----------------------------------------------------------------------
     # 1. Download model files (resumable, dropout-tolerant), then load
     # -----------------------------------------------------------------------
@@ -406,6 +422,7 @@ def main() -> None:
     sft_config = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=args.grad_accum,
@@ -493,6 +510,38 @@ def main() -> None:
     except Exception as exc:
         print(f"[WARN] Merge failed (likely OOM): {exc}")
         print("       The LoRA adapter at 'lora_adapter/' is still usable for inference.")
+
+    # -----------------------------------------------------------------------
+    # 8. Export metrics for self-improvement loop
+    # -----------------------------------------------------------------------
+    if args.metrics_output:
+        import json as _json
+        log_history = trainer.state.log_history
+        train_losses = [e["loss"] for e in log_history if "loss" in e]
+        eval_losses  = [e["eval_loss"] for e in log_history if "eval_loss" in e]
+        metrics = {
+            "epochs_trained": args.epochs,
+            "final_train_loss": train_losses[-1] if train_losses else None,
+            "final_eval_loss":  eval_losses[-1]  if eval_losses  else None,
+            "train_loss_curve": train_losses,
+            "eval_loss_curve":  eval_losses,
+            "config": {
+                "model_id":       args.model_id,
+                "learning_rate":  args.learning_rate,
+                "lora_r":         args.lora_r,
+                "lora_alpha":     args.lora_alpha,
+                "batch_size":     args.batch_size,
+                "grad_accum":     args.grad_accum,
+                "max_seq_length": args.max_seq_length,
+                "max_pixels":     args.max_pixels,
+                "warmup_ratio":   args.warmup_ratio,
+                "system_message": SYSTEM_MESSAGE,
+            },
+        }
+        Path(args.metrics_output).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.metrics_output, "w", encoding="utf-8") as f:
+            _json.dump(metrics, f, indent=2)
+        print(f"[INFO] Metrics written -> {args.metrics_output}")
 
     print("\n[DONE] Training complete.")
 
