@@ -79,14 +79,11 @@ Replace each `Phase_N` with your own class names.
 - Minimum **8 GB VRAM**
 - [LM Studio](https://lmstudio.ai) (for the self-improvement loop only)
 
-### 1 — Create a virtual environment
+### 1 — Create a conda environment
 
 ```bash
-python -m venv venv
-# Windows:
-venv\Scripts\activate
-# Linux / Mac:
-source venv/bin/activate
+conda create -n vlm-crystallography python=3.11 -y
+conda activate vlm-crystallography
 ```
 
 ### 2 — Install PyTorch >= 2.7.0
