@@ -1,6 +1,10 @@
-# Generated datasets
+# Generated datasets and crops
 data/train.jsonl
 data/val.jsonl
+data/crops/
+
+# Unsloth compiled cache
+unsloth_compiled_cache/
 
 # Model outputs and checkpoints
 outputs/

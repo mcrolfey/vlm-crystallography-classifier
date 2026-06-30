@@ -65,8 +65,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
     p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--max_seq_length", type=int, default=512,
-                   help="Max token sequence length. 512 is enough for classification.")
+    p.add_argument("--max_seq_length", type=int, default=768,
+                   help="Max token sequence length. 768 handles crop+full image tokens "
+                        "plus coordinate response. Drop to 512 if you get OOM.")
     p.add_argument("--max_pixels", type=int, default=200704,
                    help="Max image pixels fed to the vision encoder "
                         "(200704 = 256×28×28, ~3-4x faster than 602112). "
@@ -273,21 +274,18 @@ SYSTEM_MESSAGE = DEFAULT_SYSTEM_MESSAGE
 
 class CrystallographyDataset(Dataset):
     """
-    Reads a JSONL file produced by prepare_yolo_to_vlm.py and returns
-    Qwen2.5-VL conversation dicts with PIL images embedded.
+    Reads a JSONL file produced by prepare_yolo_to_vlm.py (one record per
+    bounding box) and returns Qwen2.5-VL conversation dicts with two images:
 
-    Oversampling strategy
-    ---------------------
-    The crystallography dataset is heavily imbalanced (e.g. A-AM: 58 images
-    vs A-CP: 4 428 images).  Without correction the model learns to ignore
-    rare classes entirely.
+        [crop image]  [full image]  <prompt>
+        -> "A-CF at [x1, y1, x2, y2]"
 
-    For every record we find the rarest class it contains and compute:
-        repeat = clamp(target_count / rarest_class_count, 1, max_ratio)
+    The crop shows the model exactly what a specific phase looks like; the
+    full image gives spatial context for the normalised coordinates.
 
-    where target_count is the median class count across the training set.
-    The record is then duplicated `repeat` times.  Validation data is never
-    oversampled.
+    Oversampling: since each record has exactly one class_id, we count
+    per-class box frequencies and repeat minority-class records so the
+    training set is roughly balanced (target = median class frequency).
     """
 
     def __init__(
@@ -314,13 +312,9 @@ class CrystallographyDataset(Dataset):
         if max_samples > 0:
             raw = raw[:max_samples]
 
-        # ----- oversampling -----
+        # ----- oversampling (one class_id per record in new format) -----
         if max_oversample_ratio > 1:
-            # Count how many images each class appears in
-            class_counts: Counter = Counter()
-            for rec in raw:
-                for cid in rec.get("label_ids", []):
-                    class_counts[cid] += 1
+            class_counts: Counter = Counter(r["class_id"] for r in raw)
 
             if class_counts:
                 sorted_counts = sorted(class_counts.values())
@@ -328,31 +322,22 @@ class CrystallographyDataset(Dataset):
 
                 self.records = []
                 for rec in raw:
-                    ids = rec.get("label_ids", [])
-                    if ids:
-                        rarest = min(class_counts[cid] for cid in ids)
-                        repeat = min(max(1, math.ceil(target / rarest)),
-                                     max_oversample_ratio)
-                    else:
-                        repeat = 1
+                    cid = rec["class_id"]
+                    cnt = class_counts[cid]
+                    repeat = min(max(1, math.ceil(target / cnt)), max_oversample_ratio)
                     self.records.extend([rec] * repeat)
 
-                # Report class counts after oversampling
-                after: Counter = Counter()
-                for rec in self.records:
-                    for cid in rec.get("label_ids", []):
-                        after[cid] += 1
-
+                after: Counter = Counter(r["class_id"] for r in self.records)
                 print(f"[INFO] Dataset '{jsonl_path.name}' — "
                       f"{len(raw)} raw -> {len(self.records)} after oversampling "
                       f"(max ratio {max_oversample_ratio}x, target {target})")
-                print("[INFO] Class counts after oversampling:")
+                print("[INFO] Class box counts after oversampling:")
                 for cid in sorted(after):
                     print(f"       class {cid}: {after[cid]:>6,}")
             else:
                 self.records = raw
                 print(f"[INFO] Dataset '{jsonl_path.name}' loaded: {len(raw)} samples "
-                      "(no label_ids found — oversampling skipped).")
+                      "(no class_id found — oversampling skipped).")
         else:
             self.records = raw
             print(f"[INFO] Dataset '{jsonl_path.name}' loaded: {len(raw)} samples "
@@ -364,25 +349,33 @@ class CrystallographyDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         rec = self.records[idx]
 
-        # Load image — skip broken files gracefully
+        # Image 1: crop of the bounding box region (shows what the class looks like)
         try:
-            image = Image.open(rec["image_path"]).convert("RGB")
+            crop = Image.open(rec["crop_path"]).convert("RGB")
+        except Exception as exc:
+            print(f"[WARN] Cannot open crop {rec.get('crop_path','?')}: {exc}. Using blank.")
+            crop = Image.new("RGB", (112, 112), color=(128, 128, 128))
+
+        # Image 2: full microscopy image (gives spatial context for coordinates)
+        try:
+            full = Image.open(rec["image_path"]).convert("RGB")
         except Exception as exc:
             print(f"[WARN] Cannot open image {rec['image_path']}: {exc}. Using blank.")
-            image = Image.new("RGB", (224, 224), color=(128, 128, 128))
+            full = Image.new("RGB", (224, 224), color=(128, 128, 128))
 
         return {
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": image},
+                        {"type": "image", "image": crop},   # crop first
+                        {"type": "image", "image": full},   # full image second
                         {"type": "text", "text": rec["prompt"]},
                     ],
                 },
                 {
                     "role": "assistant",
-                    "content": rec["response"],
+                    "content": rec["response"],  # e.g. "A-CF at [0.21, 0.39, 0.29, 0.49]"
                 },
             ]
         }
