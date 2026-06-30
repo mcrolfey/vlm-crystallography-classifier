@@ -59,8 +59,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora_alpha",     type=int,   default=16)
     p.add_argument("--batch_size",     type=int,   default=1)
     p.add_argument("--grad_accum",     type=int,   default=8)
-    p.add_argument("--max_seq_length", type=int,   default=1024)
-    p.add_argument("--max_pixels",     type=int,   default=602112)
+    p.add_argument("--max_seq_length", type=int,   default=768,
+                   help="Token budget; 768 handles crop+full image + coordinate response.")
+    p.add_argument("--max_pixels",     type=int,   default=200704,
+                   help="Max image pixels. Keep <= 200704 on 8 GB with two images per sample.")
     p.add_argument("--warmup_ratio",   type=float, default=0.03)
     # LM Studio
     p.add_argument("--lm_studio_url",   default="http://localhost:1234/v1",
@@ -158,12 +160,17 @@ SUGGESTION_SCHEMA = """\
 
 SYSTEM_PROMPT = textwrap.dedent("""\
     You are an expert ML engineer specialising in fine-tuning vision-language models
-    on limited VRAM (8 GB RTX 3070). You review training metrics and suggest concrete
-    hyperparameter or prompt changes to improve the next training cycle.
+    on limited VRAM (8 GB RTX 3070 Laptop). You review training metrics and suggest
+    concrete hyperparameter or prompt changes to improve the next training cycle.
+
+    Task context: the model is trained as a crystallographic phase detector. Each
+    training sample contains TWO images (a bounding-box crop and the full microscopy
+    image) and the model must output: CLASS at [x1, y1, x2, y2]. This is a grounding
+    task, not simple classification — the model must learn precise coordinate output.
 
     Rules:
-    - Keep batch_size=1 (hardware constraint).
-    - Keep max_pixels <= 602112 (VRAM constraint).
+    - Keep batch_size=1 (hard GPU constraint).
+    - Keep max_pixels <= 200704 (8 GB constraint with two images per sample).
     - Prefer small, targeted changes over large sweeps.
     - Return ONLY valid JSON matching the schema — no markdown fences, no explanation outside the JSON.
 """)
@@ -275,7 +282,7 @@ ALLOWED_CONFIG_KEYS = {
 VRAM_GUARDS = {
     "batch_size":     (1, 1),        # must stay 1 on 8 GB
     "max_seq_length": (256, 2048),
-    "max_pixels":     (65536, 602112),
+    "max_pixels":     (65536, 200704),   # 8 GB ceiling with two images per sample
     "lora_r":         (4, 64),
     "lora_alpha":     (4, 128),
     "grad_accum":     (1, 32),
