@@ -86,6 +86,9 @@ def parse_args() -> argparse.Namespace:
     # to extract patch features, which it does well out-of-the-box.
     p.add_argument("--finetune_vision", action="store_true",
                    help="Also train vision encoder LoRA layers (needs ≥ 16 GB VRAM).")
+    p.add_argument("--max_oversample_ratio", type=int, default=15,
+                   help="Max times a minority-class sample may be repeated to balance "
+                        "the training set. Set to 1 to disable oversampling.")
     p.add_argument("--resume_from_checkpoint", default=None,
                    help="Path to a checkpoint directory to resume training from.")
     p.add_argument("--metrics_output", default=None,
@@ -273,41 +276,87 @@ class CrystallographyDataset(Dataset):
     Reads a JSONL file produced by prepare_yolo_to_vlm.py and returns
     Qwen2.5-VL conversation dicts with PIL images embedded.
 
-    Each sample format expected by UnslothVisionDataCollator:
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": <PIL.Image>},
-                        {"type": "text",  "text": "<prompt>"},
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "content": "<response>",
-                },
-            ]
-        }
+    Oversampling strategy
+    ---------------------
+    The crystallography dataset is heavily imbalanced (e.g. A-AM: 58 images
+    vs A-CP: 4 428 images).  Without correction the model learns to ignore
+    rare classes entirely.
+
+    For every record we find the rarest class it contains and compute:
+        repeat = clamp(target_count / rarest_class_count, 1, max_ratio)
+
+    where target_count is the median class count across the training set.
+    The record is then duplicated `repeat` times.  Validation data is never
+    oversampled.
     """
 
-    def __init__(self, jsonl_path: str, max_samples: int = 0):
-        self.records: list[dict] = []
+    def __init__(
+        self,
+        jsonl_path: str,
+        max_samples: int = 0,
+        max_oversample_ratio: int = 15,
+    ):
+        from collections import Counter
+        import math
+
         jsonl_path = Path(jsonl_path)
         if not jsonl_path.exists():
             sys.exit(f"[ERROR] Dataset not found: {jsonl_path}\n"
                      "        Run prepare_yolo_to_vlm.py first.")
 
+        raw: list[dict] = []
         with open(jsonl_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    self.records.append(json.loads(line))
+                    raw.append(json.loads(line))
 
         if max_samples > 0:
-            self.records = self.records[:max_samples]
+            raw = raw[:max_samples]
 
-        print(f"[INFO] Dataset '{jsonl_path.name}' loaded: {len(self.records)} samples.")
+        # ----- oversampling -----
+        if max_oversample_ratio > 1:
+            # Count how many images each class appears in
+            class_counts: Counter = Counter()
+            for rec in raw:
+                for cid in rec.get("label_ids", []):
+                    class_counts[cid] += 1
+
+            if class_counts:
+                sorted_counts = sorted(class_counts.values())
+                target = sorted_counts[len(sorted_counts) // 2]  # median
+
+                self.records = []
+                for rec in raw:
+                    ids = rec.get("label_ids", [])
+                    if ids:
+                        rarest = min(class_counts[cid] for cid in ids)
+                        repeat = min(max(1, math.ceil(target / rarest)),
+                                     max_oversample_ratio)
+                    else:
+                        repeat = 1
+                    self.records.extend([rec] * repeat)
+
+                # Report class counts after oversampling
+                after: Counter = Counter()
+                for rec in self.records:
+                    for cid in rec.get("label_ids", []):
+                        after[cid] += 1
+
+                print(f"[INFO] Dataset '{jsonl_path.name}' — "
+                      f"{len(raw)} raw -> {len(self.records)} after oversampling "
+                      f"(max ratio {max_oversample_ratio}x, target {target})")
+                print("[INFO] Class counts after oversampling:")
+                for cid in sorted(after):
+                    print(f"       class {cid}: {after[cid]:>6,}")
+            else:
+                self.records = raw
+                print(f"[INFO] Dataset '{jsonl_path.name}' loaded: {len(raw)} samples "
+                      "(no label_ids found — oversampling skipped).")
+        else:
+            self.records = raw
+            print(f"[INFO] Dataset '{jsonl_path.name}' loaded: {len(raw)} samples "
+                  "(oversampling disabled).")
 
     def __len__(self) -> int:
         return len(self.records)
@@ -396,8 +445,14 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # 3. Datasets
     # -----------------------------------------------------------------------
-    train_dataset = CrystallographyDataset(args.train_jsonl)
-    val_dataset = CrystallographyDataset(args.val_jsonl)
+    train_dataset = CrystallographyDataset(
+        args.train_jsonl,
+        max_oversample_ratio=args.max_oversample_ratio,
+    )
+    val_dataset = CrystallographyDataset(
+        args.val_jsonl,
+        max_oversample_ratio=1,  # never oversample validation
+    )
 
     # -----------------------------------------------------------------------
     # 4. Collator
