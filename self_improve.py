@@ -375,6 +375,10 @@ def main() -> None:
     print(f"  LM Studio: {args.lm_studio_url}  model={args.lm_studio_model}")
     print("="*60)
 
+    best_eval_loss = float("inf")
+    best_config:    dict[str, Any] = deepcopy(config)
+    best_cycle:     int = 0
+
     for cycle in range(1, args.cycles + 1):
         print(f"\n{'#'*60}")
         print(f"  CYCLE {cycle} / {args.cycles}")
@@ -402,8 +406,16 @@ def main() -> None:
             print(f"[ERROR] Cycle {cycle} failed — stopping loop.")
             break
 
+        eval_loss = metrics.get("final_eval_loss") or float("inf")
         print(f"\n[METRICS] train_loss={metrics.get('final_train_loss')}  "
-              f"eval_loss={metrics.get('final_eval_loss')}")
+              f"eval_loss={eval_loss}")
+
+        # Track the best config seen so far
+        if eval_loss < best_eval_loss:
+            best_eval_loss = eval_loss
+            best_config    = deepcopy(config)
+            best_cycle     = cycle
+            print(f"[BEST]  New best eval_loss={best_eval_loss:.4f} at cycle {best_cycle}")
 
         if cycle == args.cycles:
             save_cycle_log(log_dir, cycle, config, metrics, None, config)
@@ -431,6 +443,24 @@ def main() -> None:
 
         save_cycle_log(log_dir, cycle, config, metrics, suggestion, next_config)
         config = next_config
+
+    # -----------------------------------------------------------------------
+    # Save the best config so train_qwen_classifier.py picks it up next run
+    # -----------------------------------------------------------------------
+    best_config_path = Path(args.output_dir) / "best_config.json"
+    best_config_out  = {k: v for k, v in best_config.items() if k != "system_message" or v}
+    best_config_out["_best_cycle"]     = best_cycle
+    best_config_out["_best_eval_loss"] = best_eval_loss
+    best_config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(best_config_path, "w", encoding="utf-8") as f:
+        json.dump(best_config_out, f, indent=2)
+
+    print(f"\n[BEST CONFIG] Cycle {best_cycle} had lowest eval_loss={best_eval_loss:.4f}")
+    print(f"[BEST CONFIG] Saved -> {best_config_path}")
+    print("[BEST CONFIG] train_qwen_classifier.py will use these as defaults next run.\n")
+    for k, v in best_config_out.items():
+        if not k.startswith("_"):
+            print(f"  {k}: {v}")
 
     print("\n" + "="*60)
     print("  SELF-IMPROVEMENT LOOP COMPLETE")

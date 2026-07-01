@@ -42,7 +42,29 @@ from torch.utils.data import Dataset
 # Argument parsing (before heavy imports so --help is fast)
 # ---------------------------------------------------------------------------
 
+_BEST_CONFIG_PATH = Path("outputs/self_improve/best_config.json")
+
+
+def _load_best_config() -> dict:
+    """Load hyperparameters saved by the self-improvement loop, if available."""
+    if not _BEST_CONFIG_PATH.exists():
+        return {}
+    try:
+        with open(_BEST_CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        cycle = data.get("_best_cycle", "?")
+        loss  = data.get("_best_eval_loss", "?")
+        print(f"[INFO] Loaded best config from self-improvement loop "
+              f"(cycle {cycle}, eval_loss={loss}).")
+        return {k: v for k, v in data.items() if not k.startswith("_")}
+    except Exception as e:
+        print(f"[WARN] Could not read {_BEST_CONFIG_PATH}: {e}. Using built-in defaults.")
+        return {}
+
+
 def parse_args() -> argparse.Namespace:
+    best = _load_best_config()   # populated if self_improve.py has run before
+
     p = argparse.ArgumentParser(
         description="Fine-tune Qwen2.5-VL as a crystallography classifier",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -50,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     # --- Model ---
     # Default is 3B: fits comfortably on 8 GB VRAM with frozen vision encoder.
     # Switch to 7B only if you have ≥ 16 GB VRAM.
-    p.add_argument("--model_id", default="unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit",
+    p.add_argument("--model_id", default=best.get("model_id", "unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit"),
                    help="HuggingFace model ID. 3B works on 8 GB; 7B needs ≥ 16 GB.")
     p.add_argument("--train_jsonl", default="data/train.jsonl")
     p.add_argument("--val_jsonl", default="data/val.jsonl")
@@ -60,22 +82,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_steps", type=int, default=-1,
                    help="If > 0, stop after this many steps (overrides --epochs). "
                         "Useful for quick self-improvement cycles.")
-    p.add_argument("--batch_size", type=int, default=1, help="Per-device train batch size.")
-    p.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps.")
-    p.add_argument("--learning_rate", type=float, default=2e-4)
-    p.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
-    p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--max_seq_length", type=int, default=768,
+    p.add_argument("--batch_size",     type=int,   default=best.get("batch_size",     1),
+                   help="Per-device train batch size.")
+    p.add_argument("--grad_accum",     type=int,   default=best.get("grad_accum",     8),
+                   help="Gradient accumulation steps.")
+    p.add_argument("--learning_rate",  type=float, default=best.get("learning_rate",  2e-4))
+    p.add_argument("--lora_r",         type=int,   default=best.get("lora_r",         16),
+                   help="LoRA rank.")
+    p.add_argument("--lora_alpha",     type=int,   default=best.get("lora_alpha",     16))
+    p.add_argument("--max_seq_length", type=int,   default=best.get("max_seq_length", 768),
                    help="Max token sequence length. 768 handles crop+full image tokens "
                         "plus coordinate response. Drop to 512 if you get OOM.")
-    p.add_argument("--max_pixels", type=int, default=200704,
+    p.add_argument("--max_pixels",     type=int,   default=best.get("max_pixels",     200704),
                    help="Max image pixels fed to the vision encoder "
-                        "(200704 = 256×28×28, ~3-4x faster than 602112). "
-                        "Raise to 401408 if detail is needed.")
+                        "(200704 = 256x28x28). Raise to 401408 if detail is needed.")
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--eval_steps", type=int, default=200)
     p.add_argument("--logging_steps", type=int, default=10)
-    p.add_argument("--warmup_ratio", type=float, default=0.03)
+    p.add_argument("--warmup_ratio", type=float, default=best.get("warmup_ratio", 0.03))
     # --- Download ---
     p.add_argument("--download_retries", type=int, default=20,
                    help="Retry attempts for model download (resumable on dropout).")
@@ -94,7 +118,7 @@ def parse_args() -> argparse.Namespace:
                    help="Path to a checkpoint directory to resume training from.")
     p.add_argument("--metrics_output", default=None,
                    help="If set, write a JSON file with final metrics after training completes.")
-    p.add_argument("--system_message", default=None,
+    p.add_argument("--system_message", default=best.get("system_message") or None,
                    help="Override the default system message used in training prompts.")
     return p.parse_args()
 
