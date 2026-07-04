@@ -87,7 +87,7 @@ classification in a single forward pass.
 ├── prepare_yolo_to_vlm.py   <- Step 1 -- per-box crop extraction + JSONL
 ├── train_qwen_classifier.py <- Step 2 -- fine-tuning pipeline
 ├── test_model.py            <- Step 3 -- inference + SVG overlay generation
-├── self_improve.py          <- Step 4 -- recursive self-improvement loop
+├── self_improve.py          <- Optional -- recursive self-improvement loop
 ├── outputs/
 │   └── qwen_crystallography/
 │       ├── lora_adapter/    <- LoRA weights (always saved)
@@ -172,93 +172,58 @@ object.  Increase to `0.20` if the model struggles with boundary cases.
 
 ---
 
-## Step 2 — Fine-tune
+## Step 2 — Find the Best Hyperparameters (Self-Improvement Loop)
 
-### Default (8 GB GPU, 3B model, frozen vision encoder)
+Before doing a full training run, use the self-improvement loop to find the
+best hyperparameters for your dataset.  It runs short training cycles, asks a
+local LLM to analyse the loss curves, adjusts the settings, and repeats.
+At the end it automatically saves the best config so Step 3 picks it up.
 
-```bash
-python train_qwen_classifier.py
-```
-
-### Recommended speed settings for RTX 3070 / 8 GB
-
-```bash
-python train_qwen_classifier.py --max_pixels 200704 --max_seq_length 512
-```
-
-Reducing `max_pixels` from 602112 to 200704 cuts the vision encoder from ~768 patches
-to ~256 patches — roughly a 3-4x speedup (~2-3 s/it vs ~10 s/it).
-
-### Common overrides
-
-| Scenario | Command |
-|----------|---------|
-| 8 GB default | `python train_qwen_classifier.py` |
-| 8 GB, if OOM | `python train_qwen_classifier.py --max_pixels 200704 --max_seq_length 512` |
-| Resume after crash | `python train_qwen_classifier.py --resume_from_checkpoint outputs/qwen_crystallography/checkpoint-400` |
-| Run only N steps | `python train_qwen_classifier.py --max_steps 200` |
-| 12 GB, unfreeze vision | `python train_qwen_classifier.py --finetune_vision` |
-| 16 GB+, use 7B model | `python train_qwen_classifier.py --model_id unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit --finetune_vision --max_seq_length 1536` |
-| Longer training | `python train_qwen_classifier.py --epochs 5 --learning_rate 1e-4` |
-| Bigger LoRA | `python train_qwen_classifier.py --lora_r 32 --lora_alpha 32` |
-
-### If you get CUDA Out of Memory
-
-Delete the compiled cache and reduce image resolution:
-```bash
-rmdir /s /q unsloth_compiled_cache
-python train_qwen_classifier.py --max_pixels 200704 --max_seq_length 512
-```
-
----
-
-## Step 3 — Self-Improvement Loop
-
-`self_improve.py` orchestrates a recursive loop:
-
-1. Runs `train_qwen_classifier.py` as a subprocess for N steps/epochs
-2. Reads the exported metrics (loss curves, final loss)
-3. Calls a local LLM via LM Studio to suggest hyperparameter / prompt improvements
-4. Applies the suggestions (with VRAM safety guards) and re-trains
-5. Logs every cycle to `outputs/self_improve/loop_logs/cycle_NN.json`
-
-### LM Studio setup
+### 2a — Set up LM Studio
 
 1. Download and install [LM Studio](https://lmstudio.ai)
-2. Load any chat model (e.g. Gemma, Llama, Mistral)
-3. Go to **Local Server** tab and click **Start Server** (default port 1234)
-4. Note the model identifier shown — you pass it to `--lm_studio_model`
+2. Load any chat model (Gemma, Llama, Mistral, etc.)
+3. Go to the **Local Server** tab and click **Start Server** (default port 1234)
+4. Find the model identifier — run this to confirm:
 
-Verify the model name:
 ```bash
 curl http://localhost:1234/v1/models
 ```
 
-### Running the loop
+### 2b — Dry run (confirm LM Studio is connected)
+
+Always do this first — it takes under a minute and tests the connection without
+running any real training:
 
 ```bash
-# Dry run — tests LM Studio connection without real training
-python self_improve.py --dry_run --lm_studio_model "google/gemma-4-e4b"
-
-# 3 cycles x 100 steps each (~15 min/cycle at 9 s/it)
-python self_improve.py --cycles 3 --steps_per_cycle 100 --lm_studio_model "google/gemma-4-e4b"
-
-# 5 cycles x 2 full epochs each
-python self_improve.py --cycles 5 --epochs_per_cycle 2 --lm_studio_model "google/gemma-4-e4b"
+python self_improve.py --dry_run --lm_studio_model "YOUR_MODEL_NAME"
 ```
+
+If you see `[LLM REASONING]` printed, you are good to go.
+
+### 2c — Run the self-improvement loop
+
+Each cycle runs 100 training steps (~17 min on an RTX 3070), then the LLM
+reviews the loss and suggests new hyperparameters for the next cycle:
+
+```bash
+python self_improve.py --cycles 3 --steps_per_cycle 100 --lm_studio_model "YOUR_MODEL_NAME"
+```
+
+When the loop finishes it prints the best config found and saves it to
+`outputs/self_improve/best_config.json`.  **Step 3 loads this file
+automatically** — you do not need to copy any settings manually.
 
 ### Steps vs epochs guidance
 
-| `--steps_per_cycle` | Time/cycle (@ 9 s/it) | Signal quality |
+| `--steps_per_cycle` | Time/cycle (RTX 3070) | Signal quality |
 |---|---|---|
 | 50 | ~8 min | Minimal — early loss only |
-| 100 | ~15 min | Good — enough to show trend |
-| 200 | ~30 min | Strong |
-| 500 | ~75 min | Full early-epoch coverage |
+| 100 | ~17 min | Good — enough to show trend |
+| 200 | ~34 min | Strong |
+| 500 | ~85 min | Full early-epoch coverage |
 
 ### What the LLM can adjust
-
-The LLM returns a JSON suggestion; all values are safety-clamped before applying:
 
 | Parameter | Allowed range |
 |---|---|
@@ -269,8 +234,51 @@ The LLM returns a JSON suggestion; all values are safety-clamped before applying
 | `max_seq_length` | 256 to 2048 |
 | `warmup_ratio` | 0.0 to 0.2 |
 | `batch_size` | locked at 1 (8 GB constraint) |
-| `max_pixels` | locked at <= 602112 (8 GB constraint) |
+| `max_pixels` | locked at <= 200704 (8 GB with two images) |
 | `system_message` | free text — prompt engineering |
+
+---
+
+## Step 3 — Full Training Run
+
+Once the self-improvement loop has finished, run the full training.
+The best hyperparameters from Step 2 are loaded automatically:
+
+```bash
+python train_qwen_classifier.py
+```
+
+You will see this line at startup confirming the best config was picked up:
+
+```
+[INFO] Loaded best config from self-improvement loop (cycle 2, eval_loss=0.1843).
+```
+
+If you have not run the self-improvement loop yet, the built-in defaults are
+used instead — the script works either way.
+
+### Common overrides
+
+| Scenario | Command |
+|----------|---------|
+| 8 GB default | `python train_qwen_classifier.py` |
+| 8 GB, if OOM | `python train_qwen_classifier.py --max_pixels 150000 --max_seq_length 512` |
+| Resume after crash | `python train_qwen_classifier.py --resume_from_checkpoint outputs/qwen_crystallography/checkpoint-400` |
+| Run only N steps | `python train_qwen_classifier.py --max_steps 200` |
+| 12 GB, unfreeze vision | `python train_qwen_classifier.py --finetune_vision` |
+| 16 GB+, use 7B model | `python train_qwen_classifier.py --model_id unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit --finetune_vision --max_seq_length 1536` |
+| Longer training | `python train_qwen_classifier.py --epochs 5` |
+| Bigger LoRA | `python train_qwen_classifier.py --lora_r 32 --lora_alpha 32` |
+
+> Any flag you pass on the command line overrides the saved best config for
+> that run only — the `best_config.json` file is not modified.
+
+### If you get CUDA Out of Memory
+
+```bash
+rmdir /s /q unsloth_compiled_cache
+python train_qwen_classifier.py --max_pixels 150000 --max_seq_length 512
+```
 
 ---
 
@@ -283,6 +291,7 @@ outputs/
 │   ├── merged_16bit/    <- Full bf16 merge (needs ~16 GB free VRAM at save time).
 │   └── checkpoint-*/   <- Rolling checkpoints (3 most recent kept).
 └── self_improve/
+    ├── best_config.json <- Best hyperparameters found (auto-loaded by train_qwen_classifier.py)
     ├── cycle_01/        <- Per-cycle training outputs
     ├── cycle_02/
     ├── metrics/         <- metrics JSON exported after each cycle
