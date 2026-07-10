@@ -162,6 +162,66 @@ def oversample_records(
 # Main
 # ---------------------------------------------------------------------------
 
+def stratified_split(
+    image_records: dict[str, list[dict]],
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> tuple[list[str], list[str], list[str]]:
+    """
+    Split image paths into train / val / test, stratified by each image's
+    dominant class (most frequent class_id among its bounding boxes).
+
+    Splitting at the IMAGE level prevents data leakage — all boxes from a
+    given image always land in the same split.
+
+    Returns three lists of image paths: (train, val, test).
+    """
+    from collections import defaultdict
+
+    rng = random.Random(seed)
+
+    # Determine dominant class per image
+    class_to_images: dict[int, list[str]] = defaultdict(list)
+    for img_path, recs in image_records.items():
+        counts = Counter(r["class_id"] for r in recs)
+        dominant = counts.most_common(1)[0][0]
+        class_to_images[dominant].append(img_path)
+
+    train_imgs: list[str] = []
+    val_imgs:   list[str] = []
+    test_imgs:  list[str] = []
+
+    for cls, paths in sorted(class_to_images.items()):
+        rng.shuffle(paths)
+        n = len(paths)
+
+        # Ensure at least 1 image per split when the class is very rare
+        n_test = max(1, int(n * test_ratio)) if n >= 3 else 0
+        n_val  = max(1, int(n * val_ratio))  if n >= 2 else 0
+        n_test = min(n_test, n - n_val - 1) if n_val else min(n_test, n - 1)
+
+        test_imgs  += paths[:n_test]
+        val_imgs   += paths[n_test:n_test + n_val]
+        train_imgs += paths[n_test + n_val:]
+
+    return train_imgs, val_imgs, test_imgs
+
+
+def print_split_stats(
+    name: str,
+    records: list[dict],
+    class_names: dict[int, str],
+    total_boxes: int,
+) -> None:
+    counts = Counter(r["class_id"] for r in records)
+    unique_images = len({r["image_path"] for r in records})
+    print(f"\n[INFO] {name}: {unique_images} images, {len(records)} boxes")
+    for cid in sorted(counts):
+        pct = 100 * counts[cid] / max(1, total_boxes)
+        print(f"       {cid}: {class_names.get(cid,'?'):10s}  {counts[cid]:>6,}  ({pct:.1f}%)")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Convert YOLO dataset to per-box VLM grounding JSONL",
@@ -170,29 +230,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--images",  default=r"C:\Users\User\Desktop\uncropped_all\combined05-07-26\images")
     p.add_argument("--labels",  default=r"C:\Users\User\Desktop\uncropped_all\combined05-07-26\labels")
     p.add_argument("--classes", default="data/classes.txt")
-    p.add_argument("--crops_dir",     default="data/crops")
-    p.add_argument("--output_train",  default="data/train.jsonl")
-    p.add_argument("--output_val",    default="data/val.jsonl")
-    p.add_argument("--val_split",     type=float, default=0.10)
-    p.add_argument("--seed",          type=int,   default=42)
-    p.add_argument("--max_samples",   type=int,   default=0,
-                   help="Cap total boxes processed (0 = all). For quick tests.")
-    p.add_argument("--crop_padding",  type=float, default=0.10,
+    p.add_argument("--crops_dir",      default="data/crops")
+    p.add_argument("--output_train",   default="data/train.jsonl")
+    p.add_argument("--output_val",     default="data/val.jsonl")
+    p.add_argument("--output_test",    default="data/test.jsonl")
+    p.add_argument("--val_split",      type=float, default=0.10,
+                   help="Fraction of images reserved for validation (used during training).")
+    p.add_argument("--test_split",     type=float, default=0.10,
+                   help="Fraction of images reserved for held-out manual testing.")
+    p.add_argument("--seed",           type=int,   default=42)
+    p.add_argument("--max_samples",    type=int,   default=0,
+                   help="Cap total label files processed (0 = all). For quick tests.")
+    p.add_argument("--crop_padding",   type=float, default=0.10,
                    help="Fractional padding added around each bounding box crop.")
-    p.add_argument("--min_crop_px",   type=int,   default=112,
+    p.add_argument("--min_crop_px",    type=int,   default=112,
                    help="Minimum crop side length in pixels.")
     p.add_argument("--max_oversample_ratio", type=int, default=15,
-                   help="Max times a minority-class box may be repeated. 1 = off.")
+                   help="Max times a minority-class box may be repeated in train. 1 = off.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    image_dir   = Path(args.images)
-    label_dir   = Path(args.labels)
+    image_dir    = Path(args.images)
+    label_dir    = Path(args.labels)
     classes_file = Path(args.classes)
-    crops_dir   = Path(args.crops_dir)
+    crops_dir    = Path(args.crops_dir)
 
     for p, name in [(image_dir, "--images"), (label_dir, "--labels"),
                     (classes_file, "--classes")]:
@@ -211,10 +275,13 @@ def main() -> None:
     if args.max_samples > 0:
         label_files = label_files[: args.max_samples]
 
-    records: list[dict] = []
+    # image_path -> list of box records (split at image level, not box level)
+    from collections import defaultdict
+    image_records: dict[str, list[dict]] = defaultdict(list)
+
     skipped_no_image = 0
     skipped_small    = 0
-    class_dist: dict[int, int] = {i: 0 for i in class_names}
+    total_boxes      = 0
 
     for file_idx, label_file in enumerate(label_files):
         if file_idx % 500 == 0:
@@ -236,8 +303,9 @@ def main() -> None:
             print(f"\n[WARN] Cannot open {image_path}: {e}")
             continue
 
+        img_key = str(image_path.resolve())
+
         for box_idx, (cid, xc, yc, bw, bh) in enumerate(boxes):
-            # Skip degenerate boxes (< 0.5% of image dimension)
             if bw < 0.005 or bh < 0.005:
                 skipped_small += 1
                 continue
@@ -254,11 +322,11 @@ def main() -> None:
 
             class_name = class_names.get(cid, f"class_{cid}")
             response   = f"{class_name} at [{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]"
-            class_dist[cid] = class_dist.get(cid, 0) + 1
+            total_boxes += 1
 
-            records.append({
+            image_records[img_key].append({
                 "crop_path":  str(crop_path.resolve()),
-                "image_path": str(image_path.resolve()),
+                "image_path": img_key,
                 "class_id":   cid,
                 "class_name": class_name,
                 "bbox":       bbox,
@@ -266,41 +334,66 @@ def main() -> None:
                 "response":   response,
             })
 
-    print(f"\n[INFO] Total box records   : {len(records)}")
-    print(f"[INFO] Skipped (no image)  : {skipped_no_image}")
-    print(f"[INFO] Skipped (tiny box)  : {skipped_small}")
-    print("[INFO] Class distribution (# boxes):")
-    for cid, cnt in sorted(class_dist.items()):
-        print(f"       {cid}: {class_names.get(cid,'?'):10s} -> {cnt}")
+    print(f"\n[INFO] Total images with boxes : {len(image_records)}")
+    print(f"[INFO] Total box records        : {total_boxes}")
+    print(f"[INFO] Skipped (no image)       : {skipped_no_image}")
+    print(f"[INFO] Skipped (tiny box)       : {skipped_small}")
 
-    # Shuffle before split so val images are representative
-    random.seed(args.seed)
-    random.shuffle(records)
+    # -----------------------------------------------------------------------
+    # Stratified split at IMAGE level
+    # -----------------------------------------------------------------------
+    train_imgs, val_imgs, test_imgs = stratified_split(
+        image_records,
+        val_ratio=args.val_split,
+        test_ratio=args.test_split,
+        seed=args.seed,
+    )
 
-    # Oversample training set only (applied after split)
-    val_size   = max(1, int(len(records) * args.val_split))
-    val_raw    = records[:val_size]
-    train_raw  = records[val_size:]
+    train_set = set(train_imgs)
+    val_set   = set(val_imgs)
+    test_set  = set(test_imgs)
 
+    # Flatten box records back out per split
+    train_raw = [r for img in train_imgs for r in image_records[img]]
+    val_raw   = [r for img in val_imgs   for r in image_records[img]]
+    test_raw  = [r for img in test_imgs  for r in image_records[img]]
+
+    print_split_stats("Train (before oversample)", train_raw, class_names, total_boxes)
+    print_split_stats("Val  ",                     val_raw,   class_names, total_boxes)
+    print_split_stats("Test ",                     test_raw,  class_names, total_boxes)
+
+    # -----------------------------------------------------------------------
+    # Oversample training boxes only
+    # -----------------------------------------------------------------------
     if args.max_oversample_ratio > 1:
         train_records = oversample_records(train_raw, args.max_oversample_ratio)
-        print(f"[INFO] Training: {len(train_raw)} -> {len(train_records)} after oversampling")
+        print(f"\n[INFO] Training: {len(train_raw)} -> {len(train_records)} after oversampling")
     else:
         train_records = train_raw
 
-    val_records = val_raw
-    print(f"[INFO] Val: {len(val_records)} boxes (no oversampling)")
-
+    # -----------------------------------------------------------------------
+    # Write JSONL files
+    # -----------------------------------------------------------------------
     for out_path, data in [
         (args.output_train, train_records),
-        (args.output_val,   val_records),
+        (args.output_val,   val_raw),
+        (args.output_test,  test_raw),
     ]:
         with open(out_path, "w", encoding="utf-8") as f:
             for rec in data:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         print(f"[INFO] Wrote {len(data):>7,} records -> {out_path}")
 
-    print("[DONE] Dataset preparation complete.")
+    # Write a plain text list of test image paths for easy use with test_model.py
+    test_images_txt = Path(args.output_test).parent / "test_images.txt"
+    with open(test_images_txt, "w", encoding="utf-8") as f:
+        for img in sorted(test_set):
+            f.write(img + "\n")
+    print(f"[INFO] Test image list -> {test_images_txt}")
+
+    print("\n[DONE] Dataset preparation complete.")
+    print(f"       Run inference on test images:")
+    print(f"       python test_model.py --image_list {test_images_txt}")
 
 
 if __name__ == "__main__":

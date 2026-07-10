@@ -1,6 +1,8 @@
 # Generated datasets and crops
 data/train.jsonl
 data/val.jsonl
+data/test.jsonl
+data/test_images.txt
 data/crops/
 
 # Unsloth compiled cache

@@ -77,7 +77,10 @@ def parse_args() -> argparse.Namespace:
         description="Detect crystallographic phases and generate SVG overlays",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("images", nargs="+", help="Image file(s) or director(ies) to process.")
+    p.add_argument("images", nargs="*", help="Image file(s) or director(ies) to process.")
+    p.add_argument("--image_list", default=None,
+                   help="Path to a text file with one image path per line "
+                        "(produced by prepare_yolo_to_vlm.py as data/test_images.txt).")
     p.add_argument("--adapter", default="outputs/qwen_crystallography/lora_adapter")
     p.add_argument("--classes", default="data/classes.txt")
     p.add_argument("--max_new_tokens", type=int, default=512,
@@ -335,10 +338,22 @@ def main() -> None:
     prompt = build_detection_prompt(class_names)
     model, processor = load_model(Path(args.adapter))
 
-    # Expand paths
+    # Expand paths — from positional args and/or --image_list file
     all_images: list[Path] = []
     for img_arg in args.images:
         all_images.extend(collect_images(Path(img_arg)))
+
+    if args.image_list:
+        list_path = Path(args.image_list)
+        if not list_path.exists():
+            sys.exit(f"[ERROR] --image_list file not found: {list_path}")
+        with open(list_path, encoding="utf-8") as f:
+            for line in f:
+                p = Path(line.strip())
+                if p.is_file():
+                    all_images.append(p)
+                elif line.strip():
+                    print(f"[SKIP] Not found: {p}")
 
     if not all_images:
         sys.exit("[ERROR] No valid image files found.")
