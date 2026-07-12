@@ -32,6 +32,7 @@ import math
 import os
 import random
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from PIL import Image
@@ -143,7 +144,7 @@ def oversample_records(
     max_ratio: int,
 ) -> list[dict]:
     """Repeat minority-class records so all classes appear proportionally."""
-    from collections import Counter
+
     counts: Counter = Counter(r["class_id"] for r in records)
     if not counts:
         return records
@@ -177,12 +178,12 @@ def stratified_split(
 
     Returns three lists of image paths: (train, val, test).
     """
-    from collections import defaultdict
+
 
     rng = random.Random(seed)
 
     # Determine dominant class per image
-    class_to_images: dict[int, list[str]] = defaultdict(list)
+    class_to_images: dict[int, list[str]] = defaultdict(list)  # type: ignore[assignment]
     for img_path, recs in image_records.items():
         counts = Counter(r["class_id"] for r in recs)
         dominant = counts.most_common(1)[0][0]
@@ -276,7 +277,7 @@ def main() -> None:
         label_files = label_files[: args.max_samples]
 
     # image_path -> list of box records (split at image level, not box level)
-    from collections import defaultdict
+
     image_records: dict[str, list[dict]] = defaultdict(list)
 
     skipped_no_image = 0
