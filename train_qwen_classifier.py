@@ -276,9 +276,19 @@ def load_model_from_cache(
         device_map={"": 0},
     )
     # min_pixels / max_pixels are image-processor settings, not model args.
+    # transformers >= 5.x made these read-only properties; fall back to
+    # reloading the processor with explicit kwargs when direct assignment fails.
     if hasattr(processor, "image_processor"):
-        processor.image_processor.min_pixels = 64 * 28 * 28   # 50176 — floor for tiny crops
-        processor.image_processor.max_pixels = max_pixels
+        try:
+            processor.image_processor.min_pixels = 64 * 28 * 28
+            processor.image_processor.max_pixels = max_pixels
+        except AttributeError:
+            from transformers import AutoProcessor
+            processor = AutoProcessor.from_pretrained(
+                local_dir,
+                min_pixels=64 * 28 * 28,
+                max_pixels=max_pixels,
+            )
     print("[INFO] Model loaded successfully.")
     return model, processor
 

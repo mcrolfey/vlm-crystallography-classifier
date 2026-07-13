@@ -245,8 +245,16 @@ def load_model(adapter_path: Path):
     )
     FastVisionModel.for_inference(model)
     if hasattr(processor, "image_processor"):
-        processor.image_processor.min_pixels = 64 * 28 * 28
-        processor.image_processor.max_pixels = 200704
+        try:
+            processor.image_processor.min_pixels = 64 * 28 * 28
+            processor.image_processor.max_pixels = 200704
+        except AttributeError:
+            from transformers import AutoProcessor
+            processor = AutoProcessor.from_pretrained(
+                str(adapter_path),
+                min_pixels=64 * 28 * 28,
+                max_pixels=200704,
+            )
     print("[INFO] Model ready.\n")
     return model, processor
 
