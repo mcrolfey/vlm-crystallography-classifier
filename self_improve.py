@@ -176,7 +176,12 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 """)
 
 
-def build_user_prompt(cycle: int, metrics: dict[str, Any], current_config: dict[str, Any]) -> str:
+def build_user_prompt(
+    cycle: int,
+    metrics: dict[str, Any],
+    current_config: dict[str, Any],
+    history: list[dict[str, Any]] | None = None,
+) -> str:
     train_curve = metrics.get("train_loss_curve", [])
     eval_curve  = metrics.get("eval_loss_curve", [])
     trend = ""
@@ -187,8 +192,27 @@ def build_user_prompt(cycle: int, metrics: dict[str, Any], current_config: dict[
         delta = eval_curve[-1] - eval_curve[0]
         trend += f" Eval loss moved {delta:+.4f} (start={eval_curve[0]:.4f}, end={eval_curve[-1]:.4f})."
 
+    # Build a compact summary of all previous cycles so the LLM can see
+    # what it changed, what effect each change had, and avoid repeating mistakes.
+    history_block = ""
+    if history:
+        lines = ["## History of completed cycles (oldest first)\n"]
+        for h in history:
+            cfg = h["config"]
+            m   = h["metrics"] or {}
+            lines.append(
+                f"Cycle {h['cycle']}: "
+                f"lr={cfg.get('learning_rate')}, lora_r={cfg.get('lora_r')}, "
+                f"lora_alpha={cfg.get('lora_alpha')}, grad_accum={cfg.get('grad_accum')}, "
+                f"warmup={cfg.get('warmup_ratio')} "
+                f"-> train_loss={m.get('final_train_loss')}, eval_loss={m.get('final_eval_loss')}"
+            )
+            if h.get("reasoning"):
+                lines.append(f"  Your reasoning then: {h['reasoning']}")
+        history_block = "\n".join(lines) + "\n\n"
+
     return textwrap.dedent(f"""\
-        ## Training cycle {cycle} results
+        {history_block}## Training cycle {cycle} results
 
         Final train loss : {metrics.get('final_train_loss')}
         Final eval loss  : {metrics.get('final_eval_loss')}
@@ -378,6 +402,7 @@ def main() -> None:
     best_eval_loss = float("inf")
     best_config:    dict[str, Any] = deepcopy(config)
     best_cycle:     int = 0
+    history:        list[dict[str, Any]] = []  # grows after each completed cycle
 
     for cycle in range(1, args.cycles + 1):
         print(f"\n{'#'*60}")
@@ -423,9 +448,12 @@ def main() -> None:
             break
 
         # --- Ask LM Studio for suggestions ---
-        user_prompt = build_user_prompt(cycle, metrics, config)
+        # Pass the full history so the LLM can see how its past adjustments
+        # affected the loss and avoid repeating ineffective changes.
+        user_prompt = build_user_prompt(cycle, metrics, config, history)
         suggestion  = ask_lm_studio(user_prompt, args)
 
+        reasoning = ""
         if suggestion is None:
             print("[WARN] No valid suggestion received — keeping current config for next cycle.")
             next_config = deepcopy(config)
@@ -440,6 +468,14 @@ def main() -> None:
                     print(f"  - {tip}")
             print("\n[CONFIG CHANGES]")
             next_config = apply_suggestions(config, suggestion)
+
+        # Append this cycle's outcome to history for subsequent LLM calls
+        history.append({
+            "cycle":     cycle,
+            "config":    deepcopy(config),
+            "metrics":   metrics,
+            "reasoning": reasoning,
+        })
 
         save_cycle_log(log_dir, cycle, config, metrics, suggestion, next_config)
         config = next_config
