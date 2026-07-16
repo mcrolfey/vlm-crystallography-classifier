@@ -27,7 +27,9 @@ boxes and labels drawn directly over the original image.
            |
            v
 2. self_improve.py          Short training cycles + LLM hyperparameter search
-           |                Saves best_config.json when done
+      OR                    Saves best_config.json when done
+   j_self_improve.py        Same + Jacobian-space class-salience at each cycle
+           |
            v
 3. train_qwen_classifier.py Full training run (auto-loads best_config.json)
            |
@@ -47,6 +49,7 @@ boxes and labels drawn directly over the original image.
 | **Stratified split** | Train / val / test split preserves per-class ratios |
 | **Class balancing** | Minority classes oversampled up to 15× in training |
 | **Self-improvement** | LLM reviews loss curves and tunes hyperparameters between cycles |
+| **J-space analysis** | Jacobian Lens measures class-name salience in intermediate layers |
 | **Auto best config** | Best hyperparameters saved and loaded automatically next run |
 | **Model merging** | MergeKit blends multiple trained checkpoints (SLERP / TIES / DARE) |
 | **SVG output** | Coloured bounding boxes + labels overlaid on original image |
