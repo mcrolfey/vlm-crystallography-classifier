@@ -26,8 +26,11 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import sys
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
@@ -89,6 +92,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--verbose", action="store_true", help="Print raw model output.")
     p.add_argument("--max_side", type=int, default=1120,
                    help="Resize images whose longest side exceeds this before inference.")
+    p.add_argument("--results_json", default=None,
+                   help="Path to save per-image detailed results as JSON.")
+    p.add_argument("--test_log", default="outputs/test_log.json",
+                   help="Cumulative test-run log (new runs appended below previous ones).")
+    p.add_argument("--no_test_log", action="store_true",
+                   help="Skip updating the cumulative test log.")
     return p.parse_args()
 
 
@@ -416,6 +425,65 @@ def main() -> None:
             name = Path(r["image"]).name
             classes_found = list({d["class_name"] for d in r["detections"]})
             print(f"  {name:35s}  {n:2d} detection(s)  {classes_found}")
+
+    # -----------------------------------------------------------------------
+    # Compute aggregate stats for this run
+    # -----------------------------------------------------------------------
+    total_detections = sum(len(r["detections"]) for r in summary)
+    images_with_det  = sum(1 for r in summary if r["detections"])
+    per_class: dict[str, int] = defaultdict(int)
+    for r in summary:
+        for det in r["detections"]:
+            per_class[det["class_name"]] += 1
+
+    print(f"\n[RESULTS] {total_detections} detection(s) across "
+          f"{len(summary)} image(s)  "
+          f"({images_with_det} with detections, "
+          f"{len(summary) - images_with_det} empty)")
+
+    # -----------------------------------------------------------------------
+    # Save per-image detailed results JSON  (--results_json)
+    # -----------------------------------------------------------------------
+    if args.results_json:
+        results_path = Path(args.results_json)
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(results_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print(f"[RESULTS] Detailed results -> {results_path}")
+
+    # -----------------------------------------------------------------------
+    # Update cumulative test log  (--test_log)
+    # -----------------------------------------------------------------------
+    if not args.no_test_log:
+        log_path = Path(args.test_log)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Load existing entries (if any)
+        existing: list[dict] = []
+        if log_path.exists():
+            try:
+                with open(log_path, encoding="utf-8") as f:
+                    existing = json.load(f)
+            except (json.JSONDecodeError, ValueError):
+                existing = []
+
+        run_entry = {
+            "run_date":              datetime.now().isoformat(timespec="seconds"),
+            "adapter":               str(Path(args.adapter).resolve()),
+            "total_images":          len(summary),
+            "images_with_detections": images_with_det,
+            "images_no_detection":   len(summary) - images_with_det,
+            "total_detections":      total_detections,
+            "per_class":             dict(sorted(per_class.items())),
+            "results_file":          str(Path(args.results_json).resolve())
+                                     if args.results_json else None,
+        }
+
+        existing.append(run_entry)
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
+        print(f"[RESULTS] Test log updated ({len(existing)} run(s) total) -> {log_path}")
 
 
 if __name__ == "__main__":
