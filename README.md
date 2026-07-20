@@ -50,6 +50,7 @@ boxes and labels drawn directly over the original image.
 | **Class balancing** | Minority classes oversampled up to 15× in training |
 | **Self-improvement** | LLM reviews loss curves and tunes hyperparameters between cycles |
 | **J-space analysis** | Jacobian Lens measures class-name salience in intermediate layers |
+| **Trajectory loss** | Optional geometric penalty on coordinate-token hidden states (`--coord_lambda`) |
 | **Auto best config** | Best hyperparameters saved and loaded automatically next run |
 | **Model merging** | MergeKit blends multiple trained checkpoints (SLERP / TIES / DARE) |
 | **SVG output** | Coloured bounding boxes + labels overlaid on original image |
@@ -319,8 +320,31 @@ If you skip Step 2, built-in defaults are used — the script works either way.
 | 16 GB+, 7B model | `python train_qwen_classifier.py --model_id unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit --finetune_vision` |
 | More epochs | `python train_qwen_classifier.py --epochs 5` |
 | Bigger LoRA | `python train_qwen_classifier.py --lora_r 32 --lora_alpha 32` |
+| Trajectory loss | `python train_qwen_classifier.py --coord_lambda 0.05` |
 
 > CLI flags override `best_config.json` for that run only — the file is not modified.
+
+### Coordinate trajectory loss (`--coord_lambda`)
+
+An optional geometric regulariser that encourages the model to commit to
+bounding-box coordinate values consistently across transformer layers.
+
+During the forward pass a boolean mask is built over the label sequence,
+marking every token that belongs to a coordinate string (digits, `.`, `[`, `]`,
+`,`).  The L2 displacement between consecutive layer hidden states is then
+computed *only at those positions* and added to the standard cross-entropy loss:
+
+```
+loss = CE_loss + coord_lambda × mean_L2_displacement(coord_positions)
+```
+
+| Value | Effect |
+|-------|--------|
+| `0.0` (default) | Disabled — no extra VRAM, identical to previous behaviour |
+| `0.01 – 0.05` | Gentle nudge; good starting point |
+| `0.1` | Stronger regularisation; monitor that CE loss doesn't stagnate |
+
+Adds ~90 MB extra VRAM (28 layers × hidden states stored for all positions).
 
 ### If you get CUDA Out of Memory
 
