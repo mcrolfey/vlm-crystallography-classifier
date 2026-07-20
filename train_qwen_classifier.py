@@ -120,6 +120,11 @@ def parse_args() -> argparse.Namespace:
                    help="If set, write a JSON file with final metrics after training completes.")
     p.add_argument("--system_message", default=best.get("system_message") or None,
                    help="Override the default system message used in training prompts.")
+    p.add_argument("--coord_lambda", type=float, default=0.0,
+                   help="Weight for the coordinate-token trajectory loss (0 = disabled). "
+                        "Penalises the L2 layer-to-layer displacement of hidden states "
+                        "measured only at coordinate token positions (numbers, [, ], ,). "
+                        "Recommended range: 0.01 – 0.1. Requires ~90 MB extra VRAM.")
     return p.parse_args()
 
 
@@ -416,6 +421,115 @@ class CrystallographyDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Coordinate-token trajectory loss
+# ---------------------------------------------------------------------------
+
+def build_coord_token_ids(tokenizer) -> torch.Tensor:
+    """
+    Return a 1-D tensor of all token IDs that can appear in coordinate strings
+    like "[0.21, 0.39, 0.29, 0.49]". Sampled from representative strings so
+    the set is complete regardless of the tokenizer's merging behaviour.
+    """
+    sample_strings = [
+        "[0.00, 0.00, 1.00, 1.00]",
+        "[0.21, 0.39, 0.29, 0.49]",
+        "[0.5, 0.5, 0.75, 0.75]",
+        "0 1 2 3 4 5 6 7 8 9 . , [ ]",
+        "0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9",
+        "0.10 0.20 0.30 0.40 0.50 0.60 0.70 0.80 0.90",
+        "0.01 0.11 0.21 0.31 0.41 0.51 0.61 0.71 0.81 0.91 0.99",
+    ]
+    ids: set[int] = set()
+    for s in sample_strings:
+        try:
+            ids.update(tokenizer.encode(s, add_special_tokens=False))
+        except Exception:
+            pass
+    result = torch.tensor(sorted(ids), dtype=torch.long)
+    print(f"[INFO] Coordinate token IDs: {len(result)} tokens identified for trajectory loss.")
+    return result
+
+
+def _masked_trajectory_loss(
+    hidden_states: tuple,
+    coord_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Mean L2 displacement between consecutive layer hidden states,
+    evaluated only at coordinate-token positions (where coord_mask is True).
+
+    hidden_states : tuple of (batch, seq, hidden), one tensor per layer
+    coord_mask    : bool tensor of shape (batch, seq)
+    """
+    device = hidden_states[0].device
+    total  = torch.zeros(1, device=device)
+    n      = 0
+    for l in range(1, len(hidden_states)):
+        delta  = (hidden_states[l].float() - hidden_states[l - 1].float())
+        l2     = delta.norm(dim=-1)        # (batch, seq)
+        masked = l2[coord_mask]
+        if masked.numel() > 0:
+            total = total + masked.mean()
+            n    += 1
+    return total / n if n > 0 else total.squeeze()
+
+
+class CoordTrajectoryTrainer:
+    """
+    Thin mixin applied to SFTTrainer that adds the coordinate trajectory loss.
+    Created at runtime so SFTTrainer is only imported once.
+    """
+
+    _coord_lambda:    float
+    _coord_token_ids: torch.Tensor
+    _traj_step:       int
+
+    def _init_trajectory(self, coord_lambda: float, coord_token_ids: torch.Tensor) -> None:
+        self._coord_lambda    = coord_lambda
+        self._coord_token_ids = coord_token_ids
+        self._traj_step       = 0
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        need_outputs = return_outputs or (self._coord_lambda > 0)
+        result = super().compute_loss(model, inputs, return_outputs=need_outputs, **kwargs)
+
+        if isinstance(result, tuple):
+            ce_loss, outputs = result
+        else:
+            ce_loss, outputs = result, None
+
+        if self._coord_lambda <= 0 or outputs is None:
+            return (ce_loss, outputs) if return_outputs else ce_loss
+
+        hidden = getattr(outputs, "hidden_states", None)
+        if not hidden or len(hidden) < 2:
+            return (ce_loss, outputs) if return_outputs else ce_loss
+
+        labels = inputs.get("labels")
+        if labels is None:
+            return (ce_loss, outputs) if return_outputs else ce_loss
+
+        coord_ids  = self._coord_token_ids.to(labels.device)
+        coord_mask = torch.isin(labels, coord_ids) & (labels != -100)
+
+        if not coord_mask.any():
+            return (ce_loss, outputs) if return_outputs else ce_loss
+
+        traj = _masked_trajectory_loss(hidden, coord_mask)
+
+        self._traj_step += 1
+        if self._traj_step % 50 == 0:
+            print(
+                f"  [TRAJ] step={self._traj_step}  "
+                f"ce={ce_loss.item():.4f}  traj={traj.item():.6f}  "
+                f"coord_tokens={coord_mask.sum().item()}"
+            )
+
+        total = ce_loss + self._coord_lambda * traj
+        return (total, outputs) if return_outputs else total
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -441,6 +555,14 @@ def main() -> None:
         max_pixels=args.max_pixels,
     )
 
+    # -----------------------------------------------------------------------
+    # 1b. Coordinate trajectory loss setup
+    # -----------------------------------------------------------------------
+    coord_token_ids: torch.Tensor | None = None
+    if args.coord_lambda > 0:
+        model.config.output_hidden_states = True
+        coord_token_ids = build_coord_token_ids(processor)
+        print(f"[INFO] Coordinate trajectory loss ENABLED  lambda={args.coord_lambda}")
     # -----------------------------------------------------------------------
     # 2. Apply LoRA
     # -----------------------------------------------------------------------
@@ -541,14 +663,27 @@ def main() -> None:
         report_to="none",              # set to "wandb" to enable W&B logging
     )
 
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=processor,
-        data_collator=collator,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        args=sft_config,
-    )
+    if args.coord_lambda > 0 and coord_token_ids is not None:
+        # Build a one-off subclass that merges CoordTrajectoryTrainer with SFTTrainer
+        _TrainerCls = type("_CoordSFTTrainer", (CoordTrajectoryTrainer, SFTTrainer), {})
+        trainer = _TrainerCls(
+            model=model,
+            tokenizer=processor,
+            data_collator=collator,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            args=sft_config,
+        )
+        trainer._init_trajectory(args.coord_lambda, coord_token_ids)
+    else:
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=processor,
+            data_collator=collator,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            args=sft_config,
+        )
 
     # -----------------------------------------------------------------------
     # 6. Train
