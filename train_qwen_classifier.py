@@ -482,12 +482,10 @@ class CoordTrajectoryTrainer:
 
     _coord_lambda:    float
     _coord_token_ids: torch.Tensor
-    _traj_step:       int
 
     def _init_trajectory(self, coord_lambda: float, coord_token_ids: torch.Tensor) -> None:
         self._coord_lambda    = coord_lambda
         self._coord_token_ids = coord_token_ids
-        self._traj_step       = 0
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         need_outputs = return_outputs or (self._coord_lambda > 0)
@@ -517,13 +515,13 @@ class CoordTrajectoryTrainer:
 
         traj = _masked_trajectory_loss(hidden, coord_mask)
 
-        self._traj_step += 1
-        if self._traj_step % 50 == 0:
-            print(
-                f"  [TRAJ] step={self._traj_step}  "
-                f"ce={ce_loss.item():.4f}  traj={traj.item():.6f}  "
-                f"coord_tokens={coord_mask.sum().item()}"
-            )
+        # Log components separately so they appear in the Trainer's log lines
+        # alongside 'loss', e.g.: {'loss': 0.18, 'ce_loss': 0.17, 'traj_loss': 0.004, ...}
+        self.log({
+            "ce_loss":        ce_loss.item(),
+            "traj_loss":      traj.item(),
+            "coord_tokens":   float(coord_mask.sum().item()),
+        })
 
         total = ce_loss + self._coord_lambda * traj
         return (total, outputs) if return_outputs else total
