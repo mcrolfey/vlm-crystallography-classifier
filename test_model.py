@@ -98,6 +98,11 @@ def parse_args() -> argparse.Namespace:
                    help="Cumulative test-run log (new runs appended below previous ones).")
     p.add_argument("--no_test_log", action="store_true",
                    help="Skip updating the cumulative test log.")
+    p.add_argument("--labels_dir", default=None,
+                   help="Path to directory containing YOLO .txt label files "
+                        "(same directory passed to prepare_yolo_to_vlm.py --labels). "
+                        "When supplied, TP / FP / FN accuracy stats are added to the "
+                        "test log by comparing detected classes against ground truth.")
     return p.parse_args()
 
 
@@ -134,6 +139,32 @@ def collect_images(p: Path) -> list[Path]:
         return [p]
     print(f"[SKIP] Path not found: {p}")
     return []
+
+
+def load_yolo_gt_classes(
+    image_path: Path,
+    labels_dir: Path,
+    class_names: dict[int, str],
+) -> set[str] | None:
+    """
+    Return the set of class names present in image_path according to its
+    YOLO label file.  Returns None if no label file exists for this image.
+    """
+    label_file = labels_dir / (image_path.stem + ".txt")
+    if not label_file.exists():
+        return None
+    gt: set[str] = set()
+    with open(label_file, encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if parts:
+                try:
+                    cls_id = int(parts[0])
+                    if cls_id in class_names:
+                        gt.add(class_names[cls_id])
+                except ValueError:
+                    pass
+    return gt
 
 
 def parse_detections(text: str) -> list[dict]:
@@ -378,6 +409,11 @@ def main() -> None:
     print(f"[INFO] Processing {len(all_images)} image(s)...\n")
     summary: list[dict] = []
 
+    labels_dir = Path(args.labels_dir) if args.labels_dir else None
+    if labels_dir and not labels_dir.is_dir():
+        print(f"[WARN] --labels_dir not found: {labels_dir}. Accuracy stats will be skipped.")
+        labels_dir = None
+
     for image_path in all_images:
         print(f"Image : {image_path.name}")
 
@@ -407,11 +443,17 @@ def main() -> None:
             svg_path.write_text(svg_str, encoding="utf-8")
             print(f"SVG   : {svg_path}")
 
+        gt_classes = (
+            load_yolo_gt_classes(image_path, labels_dir, class_names)
+            if labels_dir else None
+        )
+
         summary.append({
             "image":      str(image_path),
             "raw_output": raw_output,
             "detections": detections,
             "svg":        str(svg_path) if svg_path else None,
+            "gt_classes": sorted(gt_classes) if gt_classes is not None else None,
         })
         print()
 
@@ -467,16 +509,77 @@ def main() -> None:
             except (json.JSONDecodeError, ValueError):
                 existing = []
 
+        # -----------------------------------------------------------------------
+        # Accuracy stats (only when --labels_dir was supplied)
+        # -----------------------------------------------------------------------
+        accuracy: dict | None = None
+        if labels_dir:
+            tp_by_class: dict[str, int] = defaultdict(int)
+            fp_by_class: dict[str, int] = defaultdict(int)
+            fn_by_class: dict[str, int] = defaultdict(int)
+            images_with_labels = 0
+
+            for r in summary:
+                gt = r.get("gt_classes")
+                if gt is None:
+                    continue
+                images_with_labels += 1
+                gt_set       = set(gt)
+                detected_set = {d["class_name"] for d in r["detections"]}
+
+                for cls in detected_set:
+                    if cls in gt_set:
+                        tp_by_class[cls] += 1   # detected and present  → correct
+                    else:
+                        fp_by_class[cls] += 1   # detected but absent   → false alarm
+
+                for cls in gt_set:
+                    if cls not in detected_set:
+                        fn_by_class[cls] += 1   # present but not detected → missed
+
+            all_classes = sorted(
+                set(tp_by_class) | set(fp_by_class) | set(fn_by_class)
+            )
+            total_tp = sum(tp_by_class.values())
+            total_fp = sum(fp_by_class.values())
+            total_fn = sum(fn_by_class.values())
+            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else None
+            recall    = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else None
+
+            accuracy = {
+                "images_with_labels": images_with_labels,
+                "total_tp":           total_tp,
+                "total_fp":           total_fp,
+                "total_fn":           total_fn,
+                "precision":          round(precision, 4) if precision is not None else None,
+                "recall":             round(recall,    4) if recall    is not None else None,
+                "per_class": {
+                    cls: {
+                        "tp": tp_by_class[cls],
+                        "fp": fp_by_class[cls],
+                        "fn": fn_by_class[cls],
+                    }
+                    for cls in all_classes
+                },
+            }
+
+            print(
+                f"[ACCURACY] precision={accuracy['precision']}  "
+                f"recall={accuracy['recall']}  "
+                f"(tp={total_tp} fp={total_fp} fn={total_fn})"
+            )
+
         run_entry = {
-            "run_date":              datetime.now().isoformat(timespec="seconds"),
-            "adapter":               str(Path(args.adapter).resolve()),
-            "total_images":          len(summary),
+            "run_date":               datetime.now().isoformat(timespec="seconds"),
+            "adapter":                str(Path(args.adapter).resolve()),
+            "total_images":           len(summary),
             "images_with_detections": images_with_det,
-            "images_no_detection":   len(summary) - images_with_det,
-            "total_detections":      total_detections,
-            "per_class":             dict(sorted(per_class.items())),
-            "results_file":          str(Path(args.results_json).resolve())
-                                     if args.results_json else None,
+            "images_no_detection":    len(summary) - images_with_det,
+            "total_detections":       total_detections,
+            "per_class":              dict(sorted(per_class.items())),
+            "accuracy":               accuracy,
+            "results_file":           str(Path(args.results_json).resolve())
+                                      if args.results_json else None,
         }
 
         existing.append(run_entry)
