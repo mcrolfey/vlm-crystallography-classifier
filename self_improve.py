@@ -33,10 +33,42 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# Best-config loader (mirrors train_qwen_classifier.py)
+# ---------------------------------------------------------------------------
+
+_BEST_CONFIG_PATH = Path("outputs/self_improve/best_config.json")
+_BEST_CFG_CACHE:  dict | None = None
+
+
+def _load_best_config() -> dict:
+    global _BEST_CFG_CACHE
+    if _BEST_CFG_CACHE is not None:
+        return _BEST_CFG_CACHE
+    if not _BEST_CONFIG_PATH.exists():
+        _BEST_CFG_CACHE = {}
+        return _BEST_CFG_CACHE
+    try:
+        with open(_BEST_CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+        print(f"[INFO] Loaded previous best config from {_BEST_CONFIG_PATH} "
+              f"(cycle {cfg.get('_best_cycle', '?')}, "
+              f"eval_loss={cfg.get('_best_eval_loss', '?')}). "
+              f"Using as starting point for this run.")
+        _BEST_CFG_CACHE = cfg
+        return _BEST_CFG_CACHE
+    except Exception as exc:
+        print(f"[WARN] Could not load {_BEST_CONFIG_PATH}: {exc}. Using built-in defaults.")
+        _BEST_CFG_CACHE = {}
+        return _BEST_CFG_CACHE
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
+    best = _load_best_config()
+
     p = argparse.ArgumentParser(
         description="Self-improving VLM fine-tuning loop via LM Studio",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -49,21 +81,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps_per_cycle", type=int, default=-1,
                    help="If > 0, use max_steps instead of full epochs per cycle. "
                         "E.g. 100 steps @ ~9s/it = ~15 min per cycle.")
-    # Initial training config (mirrors train_qwen_classifier.py defaults)
+    # Initial training config — defaults come from best_config.json when available
     p.add_argument("--model_id", default="unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit")
     p.add_argument("--train_jsonl", default="data/train.jsonl")
     p.add_argument("--val_jsonl",   default="data/val.jsonl")
     p.add_argument("--output_dir",  default="outputs/self_improve")
-    p.add_argument("--learning_rate",  type=float, default=2e-4)
-    p.add_argument("--lora_r",         type=int,   default=16)
-    p.add_argument("--lora_alpha",     type=int,   default=16)
-    p.add_argument("--batch_size",     type=int,   default=1)
-    p.add_argument("--grad_accum",     type=int,   default=8)
-    p.add_argument("--max_seq_length", type=int,   default=768,
+    p.add_argument("--learning_rate",  type=float, default=best.get("learning_rate",  2e-4))
+    p.add_argument("--lora_r",         type=int,   default=best.get("lora_r",         16))
+    p.add_argument("--lora_alpha",     type=int,   default=best.get("lora_alpha",     16))
+    p.add_argument("--batch_size",     type=int,   default=best.get("batch_size",     1))
+    p.add_argument("--grad_accum",     type=int,   default=best.get("grad_accum",     8))
+    p.add_argument("--max_seq_length", type=int,   default=best.get("max_seq_length", 768),
                    help="Token budget; 768 handles crop+full image + coordinate response.")
-    p.add_argument("--max_pixels",     type=int,   default=200704,
+    p.add_argument("--max_pixels",     type=int,   default=best.get("max_pixels",     200704),
                    help="Max image pixels. Keep <= 200704 on 8 GB with two images per sample.")
-    p.add_argument("--warmup_ratio",   type=float, default=0.03)
+    p.add_argument("--warmup_ratio",   type=float, default=best.get("warmup_ratio",   0.03))
     # LM Studio
     p.add_argument("--lm_studio_url",   default="http://localhost:1234/v1",
                    help="LM Studio OpenAI-compatible API base URL.")
@@ -379,7 +411,9 @@ def main() -> None:
     metrics_dir = Path(args.output_dir) / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
-    # Starting config
+    # Starting config — merges CLI args (which already default to best_config.json values)
+    # with the system_message from the previous best run (not exposed as a CLI arg).
+    _prev_best = _load_best_config()
     config: dict[str, Any] = {
         "model_id":       args.model_id,
         "learning_rate":  args.learning_rate,
@@ -390,7 +424,7 @@ def main() -> None:
         "max_seq_length": args.max_seq_length,
         "max_pixels":     args.max_pixels,
         "warmup_ratio":   args.warmup_ratio,
-        "system_message": None,
+        "system_message": _prev_best.get("system_message") or None,
     }
 
     print("\n" + "="*60)
