@@ -67,7 +67,9 @@ def _load_best_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    best = _load_best_config()
+    # Check for --fresh before argparse runs so we know whether to use best_config.json
+    # as the source of default values.
+    best = {} if "--fresh" in sys.argv else _load_best_config()
 
     p = argparse.ArgumentParser(
         description="Self-improving VLM fine-tuning loop via LM Studio",
@@ -106,6 +108,10 @@ def parse_args() -> argparse.Namespace:
     # Misc
     p.add_argument("--dry_run", action="store_true",
                    help="Skip actual training; only test the LM Studio suggestion loop.")
+    p.add_argument("--fresh", action="store_true",
+                   help="Ignore best_config.json and start from built-in defaults. "
+                        "Without this flag the best hyperparameters from the previous "
+                        "run are used as the starting point for cycle 1.")
     p.add_argument("--log_dir", default="outputs/self_improve/loop_logs",
                    help="Directory for per-cycle JSON logs.")
     p.add_argument("--python", default=sys.executable,
