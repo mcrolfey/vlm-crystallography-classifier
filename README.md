@@ -269,6 +269,20 @@ python self_improve.py --cycles 3 --steps_per_cycle 100 --lm_studio_model "YOUR_
 
 Each cycle is ~17 min on an RTX 3070 at 100 steps.
 
+### Continuing from a previous run
+
+By default, `self_improve.py` loads `best_config.json` from the last run and
+uses those hyperparameters as the **starting point** for cycle 1 — so each
+new session builds on what was already found rather than starting from scratch.
+
+```bash
+# Continue from where the last run left off (default)
+python self_improve.py --cycles 3 --steps_per_cycle 100
+
+# Ignore previous results and start from built-in defaults
+python self_improve.py --cycles 3 --steps_per_cycle 100 --fresh
+```
+
 | `--steps_per_cycle` | Time/cycle (RTX 3070) | Signal quality |
 |---|---|---|
 | 50  | ~8 min  | Minimal — early loss only |
