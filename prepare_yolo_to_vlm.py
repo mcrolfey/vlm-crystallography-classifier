@@ -64,9 +64,10 @@ def load_classes(path: Path) -> dict[int, str]:
 
 def find_image(image_dir: Path, stem: str) -> Path | None:
     for ext in IMAGE_EXTENSIONS:
-        p = image_dir / f"{stem}{ext}"
-        if p.exists():
-            return p
+        for candidate in (ext, ext.upper()):
+            p = image_dir / f"{stem}{candidate}"
+            if p.exists():
+                return p
     return None
 
 
